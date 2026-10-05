@@ -48,6 +48,31 @@ by the `provider`, with `consolidation_id` beside it, and a record derived from 
 carries `on_behalf_of`. A credential is not a kind. Schema: `MemoryWriter`, and a pattern on a
 grant's `principal`. Suite `2026.10.4.post4`: ME-02 checks the writer's kind.
 
+**Fifth patch of 2026-10-04, same version.** A person and an agent are the same kind, and access
+has one mechanism. The fourth patch listed `member` (a person) and `harness` (an agent) as two
+kinds; they are one, `member`, and which of the two a member is, is its `type` (`human`, `agent`),
+a property no rule depends on. With that, a harness no longer carries a list of attached memories
+with an `access` that narrowed a grant: an agent reaches what it was granted, on the memory, as a
+person does. `/v1/harnesses/{id}/memories` reads the agent's principal and what it was granted, and
+sets two things: `default_memory_id` and `observe`. An agent joins a group only when someone adds
+it. Kinds are now `member`, `group` and, for a writer only, `provider`. Schema: `HarnessMemories`
+reshaped, `HarnessMemorySettings` added, `HarnessMemoryEntry` removed. Suite `2026.10.4.post5`.
+
+**Sixth patch of 2026-10-04, same version.** One graph. Entities and the relationships between
+them are not a second structure beside records: an entity is a record (new core type `entity`), a
+reference is an edge, and a relationship with something to say is a `fact` that references its
+`subject` and its `object`, so it has a writer, a time, a history and a source like any record.
+Five reference names are defined (`derived_from`, `part_of`, `about`, `subject`, `object`). One
+read, `POST /v1/memories/{id}/graph`, returns records as nodes and references as edges around a
+record or for a memory, the same for every provider; a provider declares where its entities come
+from in `graph.entities` (`derived`, `stated`, `none`). Also: an agent's membership of a group
+follows the rule a person's does (the fifth patch forbade a server to place an agent in a group on
+its own, which is not equal standing where every new person joins one). Schema: `MemoryGraph`,
+`MemoryGraphRequest`, `MemoryRecordRef`. Suite `2026.10.4.post6`: ME-10.
+
+The chapter's opening, §1, the list of an agent's tools (`memory_graph`) and §14 were then brought
+in line with the six patches above; no rule changed.
+
 - **Memories** ([Memories](versions/2026-10-04/memories.md)), the Harness Memories sub-protocol,
   optional at every class behind the `memories` capability. A memory is a named node in a tree:
   it holds records and may have child memories. A grant gives a principal privileges (`read`,

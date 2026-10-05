@@ -2182,8 +2182,8 @@
         },
         "principal": {
           "type": "string",
-          "pattern": "^(member|harness|group|x\\.[a-z0-9_.-]+):.+",
-          "description": "Who holds the grant, `<kind>:<id>`: `member`, `harness`, `group`, or a kind of the server's own, `x.`-prefixed."
+          "pattern": "^(member|group|x\\.[a-z0-9_.-]+):.+",
+          "description": "Who holds the grant, `<kind>:<id>`: a `member` (a person or an agent), a `group`, or a kind of the server's own, `x.`-prefixed."
         },
         "privileges": {
           "type": "array",
@@ -2583,10 +2583,18 @@
       "properties": {
         "kind": {
           "type": "string",
-          "pattern": "^(member|harness|provider|x\\.[a-z0-9_.-]+)$"
+          "pattern": "^(member|provider|x\\.[a-z0-9_.-]+)$"
         },
         "id": {
           "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "human",
+            "agent"
+          ],
+          "description": "For a member: a person or an agent. No rule depends on it."
         },
         "on_behalf_of": {
           "type": "string",
@@ -2721,6 +2729,125 @@
         "abstain": {
           "type": "boolean",
           "description": "True when the provider judges that nothing it returned answers the question."
+        }
+      },
+      "additionalProperties": true
+    },
+    "MemoryGraphRequest": {
+      "type": "object",
+      "properties": {
+        "around": {
+          "type": "string",
+          "description": "A record to start from. Left out, every record of this memory."
+        },
+        "hops": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "description": "References away from the start, in either direction. Default 1."
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "MemoryRecordRef": {
+      "type": "object",
+      "required": [
+        "memory_id",
+        "record_id"
+      ],
+      "properties": {
+        "memory_id": {
+          "type": "string"
+        },
+        "record_id": {
+          "type": "string"
+        }
+      }
+    },
+    "MemoryGraph": {
+      "type": "object",
+      "required": [
+        "nodes",
+        "edges",
+        "truncated"
+      ],
+      "properties": {
+        "object": {
+          "type": "string",
+          "const": "memory.graph"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "record",
+              "memory"
+            ],
+            "properties": {
+              "record": {
+                "$ref": "#/$defs/MemoryRecord"
+              },
+              "memory": {
+                "type": "object",
+                "required": [
+                  "id"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "from",
+              "to",
+              "available"
+            ],
+            "properties": {
+              "from": {
+                "$ref": "#/$defs/MemoryRecordRef"
+              },
+              "to": {
+                "$ref": "#/$defs/MemoryRecordRef"
+              },
+              "rel": {
+                "type": "string",
+                "description": "What the reference means. Absent when the target is not readable by the caller."
+              },
+              "available": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "degraded": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": true
@@ -3034,6 +3161,21 @@
           "type": "object",
           "additionalProperties": true
         },
+        "graph": {
+          "type": "object",
+          "properties": {
+            "entities": {
+              "type": "string",
+              "enum": [
+                "derived",
+                "stated",
+                "none"
+              ],
+              "description": "Where a memory's entities come from on this provider."
+            }
+          },
+          "additionalProperties": true
+        },
         "content": {
           "type": "object",
           "description": "What the content of a record may carry on this provider.",
@@ -3135,41 +3277,79 @@
         }
       }
     },
-    "HarnessMemoryEntry": {
+    "HarnessMemorySettings": {
       "type": "object",
-      "required": [
-        "memory_id"
-      ],
       "properties": {
-        "memory_id": {
-          "type": "string"
+        "default_memory_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Where an unaddressed remember goes and where turns are recorded. A memory the agent may write."
         },
-        "access": {
-          "type": "string",
-          "enum": [
-            "read",
-            "write"
-          ]
-        },
-        "default": {
+        "observe": {
           "type": "boolean",
-          "description": "Where observe and an unaddressed remember go: one entry at most, and one the agent writes."
+          "description": "Record each finished turn in the default memory. On by default."
         }
       }
     },
     "HarnessMemories": {
       "type": "object",
+      "required": [
+        "principal",
+        "data"
+      ],
       "properties": {
-        "memories": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/HarnessMemoryEntry"
-          }
+        "object": {
+          "type": "string",
+          "const": "harness.memories"
+        },
+        "principal": {
+          "type": "string",
+          "description": "Who this harness's agent is to the access model, `member:<id>`. A grant names it."
+        },
+        "default_memory_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observe": {
+          "type": "boolean"
         },
         "data": {
           "type": "array",
+          "description": "Every memory the agent holds a grant on, highest in the tree first. Read off the grants.",
           "items": {
-            "$ref": "#/$defs/HarnessMemoryEntry"
+            "type": "object",
+            "required": [
+              "id",
+              "privileges"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "privileges": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "read",
+                    "write",
+                    "create",
+                    "delete"
+                  ]
+                }
+              },
+              "default": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true
           }
         }
       }
