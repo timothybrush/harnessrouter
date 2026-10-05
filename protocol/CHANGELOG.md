@@ -2,9 +2,41 @@
 
 All notable changes to the Unified Harness Protocol.
 
-## 2026-10-04
+## 2026-10-04 (patched the same day)
 
 Additive to `2026-09-28`: every request and object valid under the previous version is valid here.
+
+**Patch of 2026-10-04, same version.** A record's `content` is an ordered list of parts, always, on
+every read ([Memories §4.3](versions/2026-10-04/memories.md#43-content)). The chapter as first
+published that morning said `content` was text or one file reference, which could not hold a
+picture beside what it shows, or a conversation turn with a file in it. Two kinds of part are
+defined, `text` and `file`; a modality is a media type of a file part, not a kind of part, so a new
+one needs no change here, and any other kind is `x.`-prefixed and carried unchanged. A file part
+may carry the words that stand for it (`text`, with `text_source`), which is what recall by words
+finds; a part may carry the `role` that said it, so a turn is observed in this same shape. A string
+remains shorthand for one text part on a write. A file part's bytes are read at
+`GET /v1/memories/{id}/records/{rid}/content/{index}` (was `/content`). A provider's capability
+document says what it keeps in `content` (`media`, `bytes`, `describes`), replacing the `files`
+flag, and a write of a media type the provider does not keep is refused with `memory_unsupported`,
+never stored without its file. Schema: `MemoryContentPart`; `MemoryRecord.content` is an array.
+Suite `2026.10.4.post1`: ME-02 expects the list, ME-09 exercises parts, order, refusals, and a file
+part kept with its description and read back byte for byte, or refused, as the provider declares.
+No implementation had shipped against the morning's text.
+
+**Second patch of 2026-10-04, same version.** A memory's `id` is opaque. The schema had required
+the `hmem_` prefix, which a server whose memories are a tree it already keeps (its own workspaces,
+its own folders) could meet only with a second id space and a lookup between the two. `hmem_`
+remains the prefix of a server that mints its own ids. Schema: the pattern is gone from `Memory.id`,
+the path parameter and a harness's entry. Suite `2026.10.4.post2`: ME-01 no longer asserts the prefix.
+
+**Third patch of 2026-10-04, same version.** `recall` searches the memory **and everything below it
+the caller may read**; the morning's text had it act on one memory. A search is how a caller finds
+where something is kept, so each result now carries `memory` (`id`, `name`): the place to walk
+from. It never searches an ancestor. `depth` narrows it (`0` is the memory alone; it used to widen,
+from a default of one memory). A server MAY cap the memories one question covers and says so in
+`degraded`. `list`, `get`, `history` and the queries still act on one memory. The provider
+capability `recall.max_depth` is gone: the subtree is the server's to compose. Schema:
+`MemoryRecall.results[].memory` is required. Suite `2026.10.4.post3`: ME-03 rewritten.
 
 - **Memories** ([Memories](versions/2026-10-04/memories.md)), the Harness Memories sub-protocol,
   optional at every class behind the `memories` capability. A memory is a named node in a tree:

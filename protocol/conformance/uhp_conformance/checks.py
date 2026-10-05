@@ -2028,7 +2028,7 @@ def me01(ctx):
     root, child = ctx.state["memory_root"], _memory_child(ctx)
     ctx.validate(root, "Memory")
     ctx.validate(child, "Memory")
-    assert str(root.get("id") or "").startswith("hmem_"), f"id {root.get('id')!r} does not carry the hmem_ prefix"
+    assert str(root.get("id") or "").strip(), "a memory must carry an id"
     assert child.get("parent_id") == root["id"] and child.get("ancestors") == [root["id"]], (
         f"the child must name its parent and its ancestors root first; got parent_id={child.get('parent_id')!r} ancestors={child.get('ancestors')!r}")
     assert child.get("provider") == root.get("provider"), "a child created without a provider must take its parent's"
@@ -2036,7 +2036,7 @@ def me01(ctx):
         f"whoever creates a memory holds all four privileges on it; got {root.get('privileges')!r}")
     kids = (ctx.client.get(f"/v1/memories?parent={root['id']}").json or {}).get("data") or []
     assert [k.get("id") for k in kids] == [child["id"]], f"the listing of a parent is its direct children; got {[k.get('id') for k in kids]}"
-    r = ctx.client.get("/v1/memories/hmem_" + "0" * 32)
+    r = ctx.client.get("/v1/memories/" + "uhp-conformance-no-such-memory-" + uuid.uuid4().hex)
     assert r.status == 404 and ((r.json or {}).get("error") or {}).get("code") == "memory_not_found", (
         f"an unknown memory must answer 404 memory_not_found; got HTTP {r.status}")
     return f"{root['id']} > {child['id']} on provider {root.get('provider')!r}"
@@ -2048,7 +2048,8 @@ def me02(ctx):
     _memories_supported(ctx)
     rec = _memory_fact(ctx)
     ctx.validate(rec, "MemoryRecord")
-    assert rec.get("content") == "Quillon Freight renews its contract every March.", f"the record does not say what was stated: {rec.get('content')!r}"
+    assert rec.get("content") == [{"type": "text", "text": "Quillon Freight renews its contract every March."}], (
+        f"a string written as content must read back as one text part, in a list; got {rec.get('content')!r}")
     assert rec.get("trust") == "untrusted", "a record read back must be marked untrusted"
     assert rec.get("memory_id") == ctx.state["memory_child"]["id"], "the record must name the memory it is in"
     assert (rec.get("written_by") or {}).get("id") != "someone-else", (
@@ -2059,25 +2060,41 @@ def me02(ctx):
     return f"{rec['id']} written by {rec.get('written_by')}"
 
 
-@check("ME-03", "Recall acts on one memory and says where the caller can go from there", "full",
-       f"{SPEC}/memories.md#61-reading-is-a-walk")
+@check("ME-03", "A question covers the memory and what is below it, names where each answer is, and never looks above", "full",
+       f"{SPEC}/memories.md#61-search-finds-the-place-then-the-agent-walks")
 def me03(ctx):
     prov = _memories_supported(ctx)
     rec, root, child = _memory_fact(ctx), ctx.state["memory_root"], ctx.state["memory_child"]
     signals = (prov.get("recall") or {}).get("signals") or []
     body = {"query": "when does Quillon Freight renew?"} if "query" in signals else {"text": "Quillon"}
+    hit = lambda res: next((x for x in res.get("results") or [] if (x.get("record") or {}).get("id") == rec["id"]), None)  # noqa: E731
     res = _recall_until(ctx, child["id"], body, rec["id"])
     ctx.validate(res, "MemoryRecall")
-    assert any((x.get("record") or {}).get("id") == rec["id"] for x in res.get("results") or []), (
-        f"the record was not recalled from its own memory with {body}")
+    assert hit(res), f"the record was not recalled from its own memory with {body}"
     assert (res.get("parent") or {}).get("id") == root["id"], "a recall must name the parent the caller may read"
-    up = ctx.client.post(f"/v1/memories/{root['id']}/recall", body=body).json or {}
-    assert not any((x.get("record") or {}).get("id") == rec["id"] for x in up.get("results") or []), (
-        "a recall on the parent returned a record of the child: a read acts on one memory and does not descend")
+    # asked of the parent, the record below is found, and the result says which memory holds it
+    up = _recall_until(ctx, root["id"], body, rec["id"])
+    ctx.validate(up, "MemoryRecall")
+    found = hit(up)
+    assert found, "a question asked of the parent did not find the record in its child: recall covers the subtree"
+    assert (found.get("memory") or {}).get("id") == child["id"], (
+        f"the result names memory {(found.get('memory') or {}).get('id')!r}, the record is in {child['id']!r}")
     kid = next((c for c in up.get("children") or [] if c.get("id") == child["id"]), None)
     assert kid and kid.get("description") == "what is known about each account", (
         "a recall must name the children the caller may read, each with its description")
-    return f"found in {child['id']}, absent from {root['id']}, which names {len(up.get('children') or [])} child"
+    # depth 0 is the memory alone
+    alone = ctx.client.post(f"/v1/memories/{root['id']}/recall", body={**body, "depth": 0}).json or {}
+    assert not hit(alone), "depth 0 returned a record of a child"
+    # and nothing looks above: a record stated in the parent is not found from the child
+    marker = "Vellacourt" + uuid.uuid4().hex[:6]
+    top = ctx.client.post(f"/v1/memories/{root['id']}/records", body={"type": "fact", "content": f"{marker} is the parent's own fact."})
+    assert top.status == 200, f"POST records on the parent answered {top.status}"
+    probe = {"query": f"what is {marker}?"} if "query" in signals else {"text": marker}
+    _recall_until(ctx, root["id"], {**probe, "depth": 0}, top.json["id"])
+    below = ctx.client.post(f"/v1/memories/{child['id']}/recall", body=probe).json or {}
+    assert not any((x.get("record") or {}).get("id") == top.json["id"] for x in below.get("results") or []), (
+        "a recall on the child returned a record of its parent: a question never looks above")
+    return f"found from {root['id']} in {child['id']}; depth 0 and the upward direction hold"
 
 
 @check("ME-04", "What a provider does not do is said, never ignored", "full", f"{SPEC}/memories.md#63-the-response")
@@ -2094,11 +2111,6 @@ def me04(ctx):
         assert said == (sig not in signals), (
             f"the provider declares signals {signals}; a recall by {sig} answered degraded={((r.json or {}).get('degraded'))}")
         notes.append(f"{sig}={'declared' if sig in signals else 'degraded'}")
-    r = ctx.client.post(f"/v1/memories/{child['id']}/recall", body={"query": "renewal", "depth": 99})
-    max_depth = int((prov.get("recall") or {}).get("max_depth") or 0)
-    if max_depth < 99:
-        assert any(str(d).startswith("depth:") for d in ((r.json or {}).get("degraded") or [])), (
-            "a depth the server capped must be reported in degraded")
     r = ctx.client.post(f"/v1/memories/{child['id']}/recall", body={})
     assert r.status == 422, f"a recall with no query, text or filters must be refused; got HTTP {r.status}"
     return ", ".join(notes)
@@ -2169,6 +2181,62 @@ def me07(ctx):
     assert (e.json or {}).get("erased") == [rid], f"erase must name what it erased; got {(e.json or {}).get('erased')}"
     assert ctx.client.get(base).status == 404, "an erased record must not read back"
     return f"forgotten, then erased with unreachable={len((e.json or {}).get('unreachable') or [])}"
+
+
+@check("ME-09", "Content is an ordered list of text and file parts, and a provider keeps what it says it keeps", "full",
+       f"{SPEC}/memories.md#43-content")
+def me09(ctx):
+    prov = _memories_supported(ctx)
+    child = _memory_child(ctx)
+    base = f"/v1/memories/{child['id']}/records"
+    two = ctx.client.post(base, body={"type": "note", "content": [{"type": "text", "text": "First line."},
+                                                                 {"type": "text", "text": "Second line."}]})
+    assert two.status == 200, f"a list of text parts was refused: HTTP {two.status} {two.text[:160]}"
+    parts = (two.json or {}).get("content")
+    assert isinstance(parts, list) and parts and all(p.get("type") == "text" for p in parts), (
+        f"content must read back as a list of parts; got {parts!r}")
+    said = " ".join(str(p.get("text")) for p in parts)
+    assert "First line." in said and said.index("First line.") < said.index("Second line."), (
+        f"the parts' words must survive in order; got {said!r}")
+    for bad, why in (([{"type": "image", "url": "x"}], "a part that is neither text, file nor x.-prefixed"),
+                     ([{"type": "text"}], "a text part with no text"),
+                     ([{"type": "file", "file": {}}], "a file part that names no file"),
+                     ([{"type": "text", "text": "x", "role": "narrator"}], "a role that is not one of the four")):
+        r = ctx.client.post(base, body={"content": bad})
+        assert r.status == 422, f"{why} must be refused with 422; got HTTP {r.status}"
+    # a file part: uploaded as Files says, named by id, completed by the server, kept or refused as declared
+    media = ((prov.get("content") or {}).get("media")) or ["text/*"]
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    boundary = "uhpconformance" + uuid.uuid4().hex
+    form = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nuser_data\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"dot.png\"\r\n"
+            f"Content-Type: image/png\r\n\r\n").encode() + png + f"\r\n--{boundary}--\r\n".encode()
+    up = ctx.client.post("/v1/files", raw=form, content_type=f"multipart/form-data; boundary={boundary}")
+    if up.status != 200:
+        return f"text parts in order; file parts not exercised (POST /v1/files answered HTTP {up.status})"
+    fid = (up.json or {}).get("id")
+    r = ctx.client.post(base, body={"type": "note", "content": [
+        {"type": "text", "text": "A dot."},
+        {"type": "file", "file": {"id": fid, "name": "forged.bin", "media_type": "application/x-forged", "bytes": 1},
+         "text": "A single black dot on white."}]})
+    import fnmatch
+    keeps = any(fnmatch.fnmatch("image/png", pat) for pat in media)
+    if not keeps:
+        assert r.status == 422 and ((r.json or {}).get("error") or {}).get("code") == "memory_unsupported", (
+            f"this provider declares content.media={media}; a png must be refused with memory_unsupported, not stored "
+            f"without its file. Got HTTP {r.status}: {r.text[:160]}")
+        return f"text parts in order; image/png refused as declared (content.media={media})"
+    assert r.status == 200, f"this provider declares it keeps image/png, and refused it: HTTP {r.status} {r.text[:160]}"
+    rec = r.json or {}
+    ctx.validate(rec, "MemoryRecord")
+    fp = next((p for p in rec.get("content") or [] if p.get("type") == "file"), None)
+    assert fp and (fp.get("file") or {}).get("media_type") == "image/png" and (fp["file"].get("name") == "dot.png"), (
+        f"the server completes a file part from its own file store, not from the caller: {fp!r}")
+    assert fp.get("text") == "A single black dot on white.", "the words that stand for a file must be kept with it"
+    idx = (rec.get("content") or []).index(fp)
+    b = ctx.client.get(f"{base}/{rec['id']}/content/{idx}")
+    assert b.status == 200 and b.body == png, f"the part's bytes must read back at its own address; got HTTP {b.status}"
+    return "text parts in order; a png kept with its description and read back byte for byte"
 
 
 @check("ME-08", "A memory moves with its subtree, and deleting it takes the subtree", "full",
