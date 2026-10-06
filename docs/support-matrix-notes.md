@@ -2585,3 +2585,539 @@ columns 5 of 5.
 
 **Not measured.** A Codex turn whose provider stays silent past the relay's wait: the relay ends such a
 call with its reason, as for every other base, and Codex was not driven into that case here.
+
+## How much a model thinks (2026-10-05)
+
+A turn can ask for a thinking level: `reasoning: {"effort": ...}` on a task, `reasoning_effort` on a
+harness, one of none, minimal, low, medium, high, xhigh. This section is what was measured to make
+that true, and it is the source of the table in `runner/reasoning.py`.
+
+**Method.** One question with a short answer, sent with no setting and then once per setting, straight
+at each provider through a connection of hr-test (`scripts/support-matrix/thinking/probe.py`, run as a
+shell command of a turn so no key leaves the instance). Judged by the provider's own usage:
+`reasoning_tokens`, with output tokens and elapsed time where a provider gives no such count. Seven
+routes (Vercel, TokenRouter, OpenRouter, OpenAI, Azure, Google AI Studio, and Anthropic's Messages API
+as TokenRouter passes it through), 66 model ids, three API shapes, about 900 calls. One sample per
+cell: the direction is the finding, not the number.
+
+**What it showed.** No field means the same thing everywhere, and a level a model lacks is refused
+with a 400, not ignored.
+
+`reasoning_effort` on Chat Completions:
+
+| models | Vercel | TokenRouter | OpenRouter | the vendor directly |
+|---|---|---|---|---|
+| gpt-5.2, 5.3-codex, 5.4, 5.4-mini | none, low to xhigh; `minimal` 400 | the same | all six | OpenAI and Azure: none, low to xhigh |
+| gpt-5.5, 5.6 line, 6-luna, 6-sol | all six | all six | all six | none, low to xhigh |
+| gpt-6.1-sol, gpt-6-astra | `none` accepted, not honoured | `none` 400 | `none` 400 | `none` 400 |
+| Claude, 4.5 to 5.5 | all six move it; opus-5.5 ignores `none` | accepted; the usage carries no count | the 5.5 line: `none` 400 | (Messages, below) |
+| Gemini 3 line | only `low` differs; `none` and `minimal` read as MORE | ignored | minimal, low, medium, high; `none` 400 | Google: none to high; `xhigh` 400 |
+| Grok 4.3, 4.5, 4.6 | two tiers; `none` reads as low | minimal to xhigh, in order; `none` 400 | the same; `none` 400 | |
+| DeepSeek v4 flash, v4.1 flash, v4 pro | `none` is off, the rest is on | the same; v4-pro `none` 400 | the same | |
+| Kimi k3 | `none` off; levels | `none` off | `none` off | |
+| Qwen 3.7-max, 3.8-flash | `none` off, the rest on | the same; low and medium 400 against the token cap | the same | |
+| Mistral medium 3.5 | none and high; minimal, low, medium 400 | none and every level | the same | |
+| Step 3.7 flash | minimal to xhigh, in order; `none` reads as more | the same | `none` 400 | |
+| MiniMax m3, Ling 3.0 flash, Nemotron 3.5 lightning, Hunyuan 3 | `none` off, the rest on | | the same | |
+| GLM 5.3, Kimi k2.7-code, Llama, Nemotron 3 super | nothing moved it, or it does not think | | | |
+
+The Responses API (`reasoning.effort`, OpenAI models only): as the first three rows, and `minimal` is
+a 400 on every route for every model tried, so `minimal` is never sent to an OpenAI model.
+
+Gemini needs Google's own setting where the field fails, and each aggregator keeps it under its own
+key. Through Vercel, `providerOptions.google.thinkingConfig` with `thinkingBudget: 0` for off and
+`thinkingLevel` for minimal, low, medium and high: gemini-3.5-flash 1,302 thinking tokens with no
+setting, 0 at a zero budget, about 600 at low, about 1,900 at high. Through TokenRouter the same
+setting under `extra_body.google.thinking_config` moves gemini-3.5-flash (0, 605, 1,636, 2,001) and
+nothing else: 3.6, 3.7, 3.8 flash and the lite models answered to no setting there. Per model: the
+pro model and the 3.7 and 3.8 flash models refuse a zero budget and `minimal` ("only works in
+thinking mode", "Thinking level MINIMAL is not supported"); the lite models do not think unless
+asked, and Google refuses `none` for them, so `none` there sends nothing.
+
+Anthropic's Messages API, read through TokenRouter's pass-through (the API's own refusals came back
+with their request ids):
+
+| model | off | a level |
+|---|---|---|
+| claude-haiku-4.5 | `thinking: disabled` | a budget (`enabled`, `budget_tokens`); adaptive and effort are 400 |
+| claude-sonnet-4.6 | `disabled` | adaptive with `output_config.effort` low, medium, high, max; `xhigh` 400 |
+| claude-opus-4.8 | `disabled` | adaptive with an effort; `enabled` 400 |
+| claude-sonnet-5, claude-opus-5 | `disabled` | adaptive with an effort |
+| claude-sonnet-5.5 | `between_tools`, the API's own word; `disabled` 400 | adaptive with an effort, xhigh and max included |
+| claude-fable-5.1 | cannot be turned off (both spellings 400) | adaptive with an effort |
+
+**The rules that follow from it** (`runner/reasoning.py`):
+
+- A level is sent only where a row above showed it accepted. A model that lacks the level asked for
+  gets the nearest one it has; `none` is given only to a turn that asked for it, and a model that
+  cannot be turned off gets its lowest level instead.
+- A model or a route that was not measured gets nothing sent and the turn's record says
+  `"applied": "default"`. A route is known by its host; a custom endpoint is not measured.
+- A level must never be what fails a call. If the provider answers 400 or 422 to a body the relay
+  wrote a level into, the body goes again as the client wrote it; if that is answered, the level is
+  dropped for that model for the rest of the turn.
+- One place by wire shape: the relay writes the level into Chat Completions, Responses, Messages and
+  Google's own bodies, for every base whose calls pass it. Three bases set it their own way: Claude
+  Code (`CLAUDE_CODE_EFFORT_LEVEL`, and `MAX_THINKING_TOKENS` for off and for the model that takes a
+  budget), Codex (`model_reasoning_effort`, which also holds on OpenAI's own endpoint and Azure's),
+  and the DeepSeek Harness driver, whose own relay calls the same functions.
+- The record: `reasoning: {"effort": asked, "applied": level}` on the response, and the provider's
+  count under `usage.output_tokens_details.reasoning_tokens`. The count is read where the relay reads
+  usage and kept apart from the usage that prices a turn, which is unchanged.
+- A turn and a harness that set no level send what they sent before: no route flag, no field, and
+  the tests compare the bytes.
+
+**Not measured, and said so in the table by absence:** Anthropic's API directly (the instance's key
+was refused that day; its rows come from the pass-through and are taken to hold), Bedrock and Vertex,
+any custom endpoint, and these ids: grok-4.20, grok-build-0.1, the other Qwen and Muse models,
+hunyuan-4-preview, claude-fable-5 (taken to be as fable-5.1). The direct OpenAI and Azure Chat
+Completions cells gave erratic counts for some models at some levels (zero where the Responses API
+gave a normal figure for the same level); the levels are accepted there, and the bases that reach
+those endpoints with OpenAI models speak the Responses API.
+
+**The column, every base** (`scripts/support-matrix/thinking/run-column.py`): one harness per base, the
+same task with no level and at none, low and high, through hr-test's connections (TokenRouter for
+these models), judged from the turn's record and the provider's count of thinking tokens. gpt-5.4
+wherever the base lists it. Run in a side container on the branch's runner, five bases at a time.
+
+| base | model | no level | none | low | high |
+|---|---|---:|---:|---:|---:|
+| codex | gpt-5.4 | 270 | 0 | 248 | 516 |
+| hermes | gpt-5.4 | 63 | 0 | 40 | 516 |
+| opencode | gpt-5.4 | 393 | 0 | 313 | 921 |
+| kilo | gpt-5.4 | 478 | 0 | 215 | 513 |
+| openhands | gpt-5.4 | 677 | 0 | 287 | 650 |
+| pi | gpt-5.4 | 0 | 0 | 230 | 485 |
+| omp | gpt-5.4 | 0 | 0 | 262 | 640 |
+| qwen | gpt-5.4 | 0 | 0 | 276 | 1,019 |
+| cline | gpt-5.4 | 0 | 0 | 298 | 778 |
+| kimi | gpt-5.4 | 0 | 0 | 242 | 666 |
+| minimax | gpt-5.4 | 0 | 0 | 192 | 512 |
+| grok | gpt-5.4 | 0 | 0 | 44 | 100 |
+| aider | gpt-5.4 | 0 | 0 | 313 | 512 |
+| agentzero | gpt-5.4 | 0 | 0 | 314 | 638 |
+| cheetahclaws | gpt-5.4 | 0 | 0 | 402 | 797 |
+| gemini | gemini-3.5-flash | 3,158 | no count | 2,531 | 4,125 |
+| goose | gpt-5.4 | 12 out | 12 out | 302 out | 652 out |
+| dsh | gpt-5.4 | 12 out | 12 out | 321 out | 698 out |
+| claude-code | claude-haiku-4.5 | 7,678 out | 859 out | 2,145 out | 7,757 out |
+
+19 of 19 bases that have a model with levels pass: every level asked is recorded as applied, none
+spends no thinking tokens, low spends fewer than high, and a turn with no level carries no
+`reasoning` on its record. System One has no model with levels and offers none. "out" is output
+tokens, where the turn has no thinking count: goose's and the DeepSeek Harness driver's calls do not
+give the relay one, and Anthropic gives none. On Gemini the provider left the count out of the answer
+that spent none (605 output tokens against 13 at the other levels: the answer written out).
+
+Claude Code's row is the weakest judge in the table and is read that way. Anthropic gives no thinking
+count, the level reaches the model as a budget (a ceiling, not a target) and the answer is written
+out at length, so one sample per level can cross: on Anthropic's own endpoint, three samples per level
+gave 791, 810 and 622 output tokens at none, 2,402, 1,700 and 2,128 at low, and 5,195, 2,838 and
+1,863 at high. Off is unmistakable; low below high holds on the sums (6,230 against 9,896) and not on
+every pair. The row above is the first run, through TokenRouter.
+
+**The same build, checked through the console and the API** (the candidate's image with the branch's
+runner and gateway, the day's last code):
+
+- The Thinking control on a harness's settings page, at 1440, 1024, 768 and 390 wide: in view, no
+  sideways scroll. Its options are the model's own (gpt-5.4: Model default, Off, Low, Medium, High,
+  Extra high; gpt-6.1-sol: the same without Off). Saved, reopened, still High. A level kept from
+  another model stays selected and the form says its tasks get the nearest one.
+- A task on that harness with no level of its own: `{"effort": "high", "applied": "high"}`, 15
+  thinking tokens. The same task asking for `none` itself: applied none. A value that is not a level:
+  400 "reasoning.effort must be one of: none, minimal, low, medium, high, xhigh".
+- hermes with gpt-5.4, asked to write a 9,000 word file as its first action: completed after 619 s
+  with 13,340 output tokens, where 0.29.4 stopped it at 93 s.
+- CheetahClaws: 4 of 4 plain turns carry their usage.
+- A task sent with `backend: "claude-code"` completes, as with `backend: "claude"`.
+
+What "no level" means differs by base on the same model, which the column shows for the first time:
+gpt-5.4 does not think unless asked, and eleven bases leave it so; Codex asks for medium itself (its
+own config default), OpenHands asks for high for every model, and hermes, opencode and kilo ask for
+something of their own. A level set on the harness or the turn replaces all of these.
+
+**Three defects the column and the hosted service found, fixed with it:**
+
+- *A turn's record read "default" for a level that had been applied.* pi and omp keep their relay
+  placeholder in a file, not the environment, and the record was read through the environment: pi with
+  gpt-5.4 spent 12, 252 and 441 output tokens at none, low and high and recorded default three times.
+  A turn now keeps the routes it registered and reads its record off them.
+- *CheetahClaws turns had no usage at all.* The relay added a streamed call's usage to the route when
+  the stream ended, which is when the provider closes it, not when its last event passes; a client
+  that is done at `[DONE]` read the route before its own call was on it. On the published 0.29.4,
+  8 of 8 plain CheetahClaws turns came back with no usage; with each chunk's figures folded in before
+  the chunk is forwarded, 0 of 6. When this began was not measured (the relay has forwarded streams
+  as they arrive since 0.29.1, which is the likely start).
+- *hermes stopped a turn whose first answer was long.* hermes writes a message into its database only
+  when it is complete, so a first answer that streamed for more than 90 s looked like a hung call and
+  was stopped (found on the hosted service; on 0.29.4 here, hermes with gpt-5.4 asked to write a
+  9,000 word file as its first action ended `incomplete` after 93 s with nothing written). The guard
+  now also asks when a provider last sent an event on the turn's route; the CLI that hangs after its
+  provider answered is still caught.
+
+Also from the hosted service: `backend` on POST /v1/responses took a base's id ("claude-code") as the
+backend, matched no model, and refused every model as having no provider there. It names the base's
+backend now.
+
+## Where a turn's fixed seconds went (2026-10-05, 0.30.1)
+
+Two changes ported from the hosted service, where both were found and first measured, and measured
+again here through a streamed task (`stream: true`, timed at the client): when the first text
+arrives, in how many steps the answer grows (text arriving after a pause of 0.1 s or more), and how
+long after the last text the task says it is complete. Warm turns of one session, medians.
+
+**The gateway asked for a turn's events every 1.2 s.** So the first text waited up to that long, a
+streamed answer grew in jumps of that size, and the end was heard at the next ask. The runner now
+holds the request (`GET /turn/{id}?wait=`) until it has an event, the turn is done, or the wait has
+passed, and says `held`; the gateway asks again at once, writes the durable trace once per interval
+instead of once per answer, and paces itself the old way when an answer does not say held (an older
+runner) or a request failed. The duties that counted polls (the lease, the heartbeat, the durable
+cancel check) count the clock. `HARNESS_RESP_HOLD_S` sets the hold (3 s; 0 asks the old way). The
+hold waits on the runner's event loop, not on a worker thread: one runner serves every session of an
+instance, and 120 turns held at once answer together in the test.
+
+**A checkpoint carried what a CLI rebuilds for itself.** omp's two native binaries, Codex's plugin
+catalogue and the DeepSeek Harness's unpacked packages travelled in the workspace's archive after
+every turn. They are left out now (`_REBUILT_CACHES`). opencode's npm cache is deliberately not:
+rebuilding it cost a turn 20 s on the hosted service.
+
+| base, model | | 0.30.0 | with the hold | with the hold and the smaller checkpoint |
+|---|---|---:|---:|---:|
+| pi, deepseek-v4-flash | first text | 2.71 s | 2.68 s | 2.88 s |
+| | steps | 2 | 5.5 | 7.5 |
+| | last text to complete | 0.20 s | 0.18 s | 0.15 s |
+| codex, gpt-5.4 | first text | 4.13 s | 3.79 s | 3.98 s |
+| | steps | 3 | 7 | 8 |
+| | last text to complete | 3.72 s | 3.19 s | 0.22 s |
+| | whole turn | 10.4 s | 8.9 s | 6.0 s |
+| omp, gpt-5.4 | steps | | 7 to 9 | 10.5 |
+| | last text to complete | | 7.5 s | 0.37 s |
+| | whole turn | | 15.4 s | 9.6 s |
+| claude-code, claude-haiku-4.5 | first text | 3.99 s | 4.22 s | |
+| | steps | 1 | 1 | |
+| hermes, gpt-5.4 | first text | 28.7 s | 23.7 s | |
+| | steps | 1 | 1 | |
+
+Read with their sizes: four to eight turns per cell, and the model's own time is most of "first
+text". What moved beyond noise is the number of steps a streamed answer grows in (pi 2 to 7.5, Codex
+3 to 8) and the end of a turn on the two bases whose checkpoint shrank (Codex 3.7 s to 0.2 s, omp
+7.5 s to 0.4 s). Claude Code and hermes hand over whole messages, so their answers arrive in one step
+either way; hermes's first text is its whole answer and its difference here is the model's.
+
+Not ported, with the reason: the hosted change that lets a turn's record writes run beside the loop
+(each write costs about 0.4 s there; here the store is a local file), and the per-turn timing log
+line that found these.
+
+## The thinking level behind a broker (2026-10-06, 0.30.2)
+
+The hosted service took the thinking level from 0.30.0 and ran the same column against it, and its
+port found what the owner-trust measurement here could not: in broker trust the gateway's own broker
+sits between the agent and the provider, and it removes the thinking controls (`thinking`,
+`context_management`, `output_config.effort`) from every Anthropic-shape request. That rule exists
+for what Claude Code sends by itself, which some model versions refuse. A level the turn had asked
+for was removed with it: the turn ran at the model's default and its record said the level had been
+applied. This tree has the same broker and the same rule.
+
+Fixed the way the hosted service fixed it: the per-turn credential the agent is handed carries the
+level as a fourth field, only when the turn asked for one, and the broker keeps the thinking controls
+of a request that arrives under such a credential. A turn that asked for nothing carries the
+credential it always did and its requests lose the controls as before. On the OpenAI shapes the
+broker never removed anything of the thinking group (`reasoning_effort`, `providerOptions`,
+`extra_body` all pass), which the hosted service pinned in a test and showed live: a Gemini model at
+`none` spent 0 thinking tokens through its broker and TokenRouter.
+
+Measured here in broker trust (a side container with `HR_SANDBOX_TRUST=broker`; the image's
+default is owner trust, where the agent holds the key and no broker is in the way). Claude Code with
+claude-haiku-4.5 through the broker and TokenRouter, output tokens of three runs per level:
+
+| | none | low | high |
+|---|---|---|---|
+| 0.30.1 | 690, 726, 768 | 838, 782, 689 | 931, 774, 712 |
+| with the fix | 730, 538, 824 | 2,277, 2,256, 1,686 | 2,284, 2,754, 3,801 |
+
+On 0.30.1 every turn recorded its level as applied and all nine spent what a turn with no level
+spends. hermes, pi and Codex with gpt-5.4 passed the column in broker trust before and after (their
+level rides `reasoning_effort` through the relay and the broker, which the gateway makes possible by
+naming the route): the first end-to-end run of the level behind this tree's own broker.
+
+The column's judge passed the 0.30.1 row: on output tokens "low below high" held by noise (2,309
+against 2,417). It now also asks, where output tokens stand in for a missing count, that low spend
+at least half again what none does; the 0.30.1 row fails it and every earlier pass still passes.
+
+The hosted column, as that session reported it (`run-column.py` from 915c834, one run per level,
+gpt-5.4 unless said; thinking tokens at none, low, high):
+
+| base | none | low | high | |
+|---|---:|---:|---:|---|
+| hermes | 0 | 62 | 403 | |
+| goose | 0 | 278 | 831 | |
+| cheetahclaws | 0 | 302 | 471 | |
+| kimi | 0 | 224 | 516 | |
+| qwen | 0 | 434 | 779 | |
+| codex | 12 out | 271 out | 501 out | no count: its calls go to the broker without passing a relay there |
+| claude-code, claude-haiku-4.5 | 721 out | 1,964 out | 2,248 out | with the broker keeping the controls |
+| opencode | | | | recorded default at every level on the first image |
+
+7 of 8. opencode, pi and omp talk to the broker directly on the hosted service (they ride the relay
+here for every keyed turn), so the relay never saw their calls; there they now take the relay for a
+turn that asks for a level. That difference between the trees is the hosted one's and is recorded
+here because the column is shared.
+
+With that change the hosted session ran the column again and reported 11 of 11, these rows among
+them (thinking tokens at none, low, high):
+
+| base | none | low | high | |
+|---|---:|---:|---:|---|
+| pi | 0 | 243 | 516 | |
+| omp | 0 | 252 | 456 | |
+| opencode | 0 | 272 | 804 | |
+| codex | 12 out | 233 out | 530 out | output tokens, as above |
+
+Not run on the hosted service at the time of writing: the Gemini CLI base, and most bases at more
+than one model.
+
+## How long a thinking model says nothing, and the relay's wait (2026-10-06, 0.31.0 and 0.31.1)
+
+The relay ends a model call that sends no event for `HR_RELAY_UPSTREAM_TIMEOUT_S`. The default was
+600 s and is 180 s from 0.31.0, the value the hosted service runs. Before changing it the cost was
+measured, because the old default had been chosen for it: a model that thinks without sending
+anything looks, on the wire, like a provider that has stopped.
+
+One hard three-part counting problem, streamed, at each model's highest thinking level, straight at
+the provider through a connection of hr-test, with the relay's own wait raised to 1,200 s so it could
+not interfere. An event is a `data:` line; a keep-alive comment line is not one, here as in the relay.
+One sample per cell. The longest run with no event:
+
+| model, level | TokenRouter | Vercel |
+|---|---:|---:|
+| gpt-5.5, xhigh, Chat Completions | 201 s | 11 s |
+| gpt-5.5, xhigh, Responses | 30 s | 61 s |
+| gpt-6.1-sol, xhigh | 19 s (Responses) | 15 s (Chat Completions) |
+| gpt-6-sol, xhigh, Chat Completions | no answer in 1,200 s | |
+| gemini-3.1-pro-preview, high | 205 s | 4.5 s |
+| claude-opus-5, xhigh | 35 s | |
+| claude-opus-5.5, xhigh | | 211 s |
+| grok-4.6, xhigh | 13 s | 12 s |
+| deepseek-v4-pro, xhigh | 2 s | |
+| kimi-k3, high | | 0.7 s |
+| qwen3.7-max, high | | 2 s |
+
+Whether thinking shows on the wire is a property of the route and the request shape, not of the
+model. Where a route forwards reasoning as it happens the stream is never quiet for long, and that
+was 13 of the 16 cells. Three were silent for over 200 s and then answered: OpenAI's Chat Completions
+through TokenRouter sends nothing until the first token of the answer (the same model on the
+Responses API, or through Vercel, streams throughout), TokenRouter's Gemini channel likewise, and
+Claude Opus 5.5 through Vercel sent one event and then keep-alive lines for 211 s. One call never
+answered at all.
+
+So the two waits buy different things. At 600 s the three silent answers complete and the call that
+never answers holds its turn for ten minutes. At 180 s that call ends in three minutes and the three
+answers are cut off as "the provider did not answer". Richard chose 180 s for both the hosted service
+and this default with these numbers in front of him. An operator who runs such models at such levels
+on such routes raises the variable; the bases that speak the Responses API to OpenAI models (Codex,
+hermes, opencode, kilo) were not exposed in any cell.
+
+**The decision was reversed the same day (0.31.1): the default is 600 s again.** Asked to find a way
+to make the three silent cells speak, a second measurement found the silence was not three cells. The
+same problem and levels, each call watched for 430 s, now also straight at the vendors and through
+OpenRouter, and with every request field that might ask a route to show its thinking:
+
+| Chat Completions, longest run with no event | TokenRouter | Vercel | OpenRouter | the vendor itself |
+|---|---:|---:|---:|---:|
+| gpt-5.5, xhigh | over 430 s (3 of 3) | 11 s | 61 s | OpenAI over 430 s; Azure over 430 s |
+| gemini-3.1-pro-preview, high | 187 s, 234 s | 4.5 s | 4.8 s | Google 141 s |
+| claude-opus-5.5, xhigh | | 211 s | 10.6 s | not measured |
+
+- **OpenAI's Chat Completions API sends nothing while a reasoning model thinks**, and that is the
+  API, not a reseller: five calls of five passed 430 s without an event, direct, on Azure and through
+  TokenRouter (where even the status line waits for the first token: headers at 201 s in the first
+  measurement). `stream_options.include_usage` and `include_reasoning` change nothing; `reasoning` is
+  refused as an unknown parameter. On the Responses API the same model sent an event at least every
+  30 s on all three, and about every 13 s with `reasoning.summary: "auto"`.
+- **Gemini** on Google's own endpoint speaks when asked with
+  `extra_body.google.thinking_config.include_thoughts: true` (longest gap 4.6 s), but the thoughts
+  arrive inside `delta.content` as `<thought>...</thought>`, with the answer after the closing tag in
+  the same chunk, so a base would show them as its answer. Through TokenRouter the field does nothing.
+- **Claude Opus 5.5 through Vercel** speaks when asked with `providerOptions.anthropic.thinking:
+  {"type": "adaptive", "display": "summarized"}`: a 255 s think with a longest gap of 6.8 s, in
+  `delta.reasoning` and `reasoning_details`, not in the content. `reasoning: {"enabled": true}` and
+  `include_reasoning` do nothing (195 s and 209 s of keep-alive lines).
+- OpenRouter spoke on all three models, and Vercel on OpenAI's and Google's.
+
+So at 180 s every base that speaks Chat Completions to an OpenAI model was exposed at a high level on
+a hard problem, and that is most bases. On those routes a call that is thinking and a call that is
+stuck look the same on the wire. Richard was offered the two request-field fixes and a longer wait
+for OpenAI's chat calls alone, and chose the old wait for everything. Neither fix was built; the
+fields above are recorded for whoever wants a shorter wait later. One sample per cell unless said,
+and how long a model thinks on one problem varies widely (the same Claude call took 29 s and 211 s).
+
+The same problem as a real task on the 0.31.1 candidate (pi, gemini-3.1-pro-preview through
+TokenRouter, thinking level high). With the wait set to 180 s, as 0.31.0 shipped it: the relay cut the
+model call four times, 183 s apart, pi retried each time, and the task failed after 737 s with "the
+provider did not answer". At the default, five runs: all five completed, after 28, 125, 179, 212 and
+494 s, with no cut; gpt-5.5 at xhigh straight at OpenAI completed after 128 s. So the shorter wait did
+not end a slow task sooner: it turned a task that finishes into one that fails four waits later.
+
+## An Azure connection that signs in with Microsoft Entra (2026-10-06, 0.31.0)
+
+For an organization that issues no API keys for its Azure resources: the connection is an application
+in the organization's own Entra directory (tenant ID, client ID, client secret), and the gateway's
+broker asks Entra for a token by the client-credentials grant and presents it as the bearer where a
+key connection sends `api-key`. Built on the hosted service and taken from there with its tests.
+
+What this tree adds is one rule. In owner trust, the image's default, a connection's key is handed
+to the agent. This connection has no key to hand, only a secret that buys a token good for about an
+hour, and a turn may run for six. So a connection of this kind goes through the gateway's broker in
+every trust mode, and the broker asks again as the token ages.
+
+Measured on the release's candidates in side containers on the test VM, in owner trust, with a test
+application in our own directory holding the "Cognitive Services OpenAI User" role on one Azure
+OpenAI resource and one Foundry resource:
+
+- **Four bases completed on the Entra connection**: pi and goose and hermes with gpt-5.4-mini, Codex
+  with gpt-5.4, each served by that connection. The gateway signed in once for all four
+  (`[entra] signed in as application ••••1234; asking again in 3299 s`, one line per sign-in).
+- **The agent holds neither the secret nor a token.** Checked while a pi turn was running a shell
+  command: none of the container's processes (the agent's and its shell's among them, read with the
+  rights to read every process's environment and command line) and none of 5,995 workspace files
+  held the client secret or an access token for Azure. The secret itself is not readable as text
+  anywhere on the data volume.
+- **The sign-in is renewed inside a running turn.** A token is good for 3,599 s and the gateway asks
+  again 300 s before that. One pi turn with gpt-5.4 was started 119 s before a sign-in was due for
+  renewal and ran six 85 s shell commands, one model call after each: 04:40:39 to 04:49:17 UTC. The
+  sign-in it began on was made at 03:47:37 (due again at 04:42:36, dead at 04:47:36). Its first two
+  model calls went out on that token; the third, at 04:43:32, made the gateway sign in again (the
+  log's line is at 04:43:32.7); the last two came after the first token's own expiry. The turn
+  completed with six tool calls and the six times. Before that, with the instance idle for an hour
+  and forty minutes past a token's expiry, the next turn signed in again by itself and completed.
+- **No role on the resource**: the same application pointed at a resource it has no role on. Azure's
+  own 401 reaches the turn: `Your azure connection was refused: ... {"code":"PermissionDenied",
+  "message":"The principal ... lacks the required data action
+  Microsoft.CognitiveServices/accounts/OpenAI/responses/write ..."}`.
+- **A directory Entra does not know**: the turn fails in 2 s on pi with `Your azure connection was
+  refused: ... Microsoft Entra refused this connection's sign-in: AADSTS90002: Tenant '...' not
+  found. ...`. Nothing is remembered of a refusal: the next call asks again.
+- **A key connection is untouched**: pi and Codex on the same Azure resource by API key completed,
+  handed the key as before.
+- **The form** on the Integrations page at 1440, 1024, 768 and 390 wide: "Sign in with" offers API
+  key and Microsoft Entra, the fields change to the directory ID, the application ID and the client
+  secret, a directory written as a name is refused with the field's own label, a saved connection
+  comes back with the secret masked and no key.
+
+Two defects came out of the measuring and are fixed in the release, here and on the hosted service:
+
+1. A sign-in Entra refuses came back from the broker as a 502. Codex reconnected five times before
+   giving up (28 s), and a 502 is not a refusal to the gateway, so the turn was free to try its next
+   connection, which is what the refused-key rule exists to prevent. A sign-in Entra answers with
+   400, 401 or 403 is now a 401 from the broker, as a refused API key is. Codex still makes its
+   reconnect attempts on a 401, as it does on a refused key, and now fails in 8 s. Entra throttling
+   or failing stays a 502.
+2. The turn said "Your azure key was refused" on a connection that has no key. It says "connection".
+
+Not measured here:
+
+- **A completed turn on a Foundry resource.** This tree's catalog has no model that the one Foundry
+  resource we could use has deployed, and only a custom connection may name a model outside the
+  catalog. What was observed is the next thing down: a catalog model asked of that resource came back
+  `404 DeploymentNotFound`, not a refusal, so the resource accepted the application's token. The
+  hosted service completed a pi turn on that resource through the same code.
+- A sovereign cloud (`HR_ENTRA_AUTHORITY`), and a client secret that expires or is rotated while a
+  turn runs.
+
+## A build said ready before its version was active (2026-10-06, 0.31.0)
+
+Issue #401: `test_the_turn_gets_the_path_the_variables_and_the_instructions` failed once in CI with
+"409: the environment has no built version" and passed on the rerun. It was not a flake. A build
+wrote its record as `ready` and made the version active in the next statement, and the record is what
+every reader waits on: the test, the console's build view, a script polling the API. A turn started
+in between was refused. On a normal disk the window is too short to meet; a slow CI disk met it.
+
+The version is now made active, and its mount made, before the record is written, and if any of the
+three steps fails the active version goes back to what it was (a failed build never becomes active,
+as before). A test asks the question at the instant the ready record is written and fails on the old
+order. On the candidate: an environment with a pip, an npm and an apt package built in 9 s, a turn
+started in the same instant its record read ready completed using the environment's package, and the
+environments column passed on pi, Codex and Claude Code, 9 of 9 tasks.
+
+## Who may run a harness (2026-10-06, 0.31.2)
+
+Until this release the harness id alone was what ran a harness: a comment in the code called it
+"the run capability", written for a marketplace in which callers run a harness and its owner pays.
+Anyone who knew an id (console links carry it) could start a task on the harness, with the owner's
+connected plugs and database, on the owner's connections. Richard's rule, made on the hosted service
+first and the same here: "a harness can run by id and workspace's API key".
+
+The caller's organization must be the harness's; a caller narrowed to a workspace runs that
+workspace's harnesses, a harness from before workspaces counting as the Default Workspace's; a key
+for the whole organization runs any of its harnesses; a built-in base has no owner. The refusal is
+`404 harness_not_found`, what every other route answers for a harness that is not the caller's. It
+is the same test the harness list already applied, so what a key lists, it runs, and a harness made
+with a key is stamped with that key's workspace, so what a key makes, it runs.
+
+Candidate `0.31.2-rc.1` in a side container on the test VM, on a copy of an instance with 77 harnesses (36 stamped with the Default Workspace, 41 from before workspaces). Keys were minted for two workspaces and for the whole organization, and a harness was made with workspace one's key:
+
+| Caller | Result |
+|---|---|
+| Workspace one's key, its own harness | completed |
+| Workspace two's key, that harness | `404 harness_not_found`, and the harness is not in its list |
+| A key for the whole organization | completed |
+| Workspace two's key, a built-in base | completed |
+| Another organization (the gateway's internal door, another organization named) | `404 harness_not_found`, also when it names the right workspace |
+| The console in workspace one | completed |
+| The console in workspace two, and in the Default Workspace | `404 harness_not_found` |
+| The Default Workspace's key, a harness made before workspaces | completed |
+
+Through the console itself (Playwright): a harness created and run on pi, with its skill, script and tool policy. Claude Code tasks complete, and all plugin checks pass on Claude Code, Codex and pi, each of which makes its own harness and runs it.
+
+## The built-in image skill in front of the media tools (2026-10-06, 0.31.3)
+
+The built-in `imagegen` skill works only through a turn's image credential. With none its script
+refuses: "image generation is not configured for this Harness. An operator needs to add an integration
+that serves an image model". On the hosted service a pi agent whose harness also carried the media
+tools read the skill first, took the sentence as final and told the person images were unavailable,
+two runs of three, with `media_generate_image` one call away. This tree has the same skill, mounted by
+default, and the same two ways to make an image, resolved from different tables: the skill's credential
+from the image model map, the media tools' providers from the integrations by kind. So a turn can have
+the second without the first: image models switched off, or broker trust without `HR_BROKER_IMAGES`.
+
+On such a turn the built-in is now dropped and suppressed. Where the turn has no other way to make an
+image the skill stays, which is where this tree differs from the hosted one: here the person asking is
+the operator, and the refusal is what says what to add.
+
+Candidate `0.31.3-rc.1` in a side container on the test VM, on a copy of an instance whose Videos kit harness carries the media tools. One request each ("make one image, then say MADE or CANNOT"):
+
+| The turn | The image skill in the session | What the agent did |
+|---|---|---|
+| Media tools, an image credential (Claude Code) | present | made the image with the media tool |
+| Media tools, no image credential (Claude Code) | absent | made the image with the media tool |
+| No media tools, no image credential (pi) | present | ran the skill and answered "CANNOT image generation not configured" |
+
+The image credential was removed by switching the instance's image models off on the Integrations document. Not reproduced here: the agent giving up in front of a working media tool. That was seen on the hosted service with a pi agent; Claude Code on this harness chose the media tool either way. What is shown here is that the skill is no longer offered in that state. Claude Code tasks complete, and all plugin checks pass on Claude Code, Codex and pi (the skill checks among them).
+
+
+## Hermes: a refusal from a tool is not its server failing (2026-10-06, 0.31.4)
+
+`hermes-agent` 0.19.0 keeps a circuit breaker per MCP server and bumps it on every error answer,
+including one a live server gave on purpose: a tool result marked `isError`, "no such document".
+Three in a row open the breaker, and for 60 s every tool of that server is refused with "MCP server
+... is unreachable after 3 consecutive failures". On the hosted service an agent that had read three
+wrong ids could then not use any tool of that server and told its person the service was down.
+
+The patch (`runner/patches/hermes_mcp_breaker.py`, the hosted one) marks the error answers that came
+from the server's own tool result and resets the breaker for those. Hermes is installed on an
+instance's first start, not in the image, so the entrypoint applies it to the installed copy on every
+start, which also repairs a volume installed before it existed.
+
+A small tool server was run inside the side container, with one tool that refuses on purpose (`get_document` of an id that does not exist is an error answer) and one that always answers (`list_documents`). One Hermes task with gpt-5.4: four refused `get_document` calls, then `list_documents`.
+
+| The instance | What `list_documents` returned |
+|---|---|
+| Published 0.31.3 | "MCP server 'company' is unreachable after 3 consecutive failures. Auto-retry available in ~50s." The server was up and answering. |
+| Candidate `0.31.4-rc.1`, started on the volume 0.31.3 had installed Hermes into | `["doc-1"]` |
+| Candidate, on a fresh volume (Hermes installed on that first start) | `["doc-1"]` |
+
+On both candidate starts the log has one line, "Hermes: a tool's own error answer no longer counts against its MCP server", and Hermes's module holds the two marks. A restart applied nothing again and logged nothing. A plain Hermes task completes. An instance started without Hermes starts, logs nothing about it, and passes the usual checks (pi and Claude Code tasks, all plugin checks on Claude Code, Codex and pi).
+
+The patch was run against the real `hermes-agent` 0.19.0 file: it changes two places and the result compiles (the test for this needs the file at hand and is skipped in CI, since Hermes is not in the image).
+
+Not shown live: a server that cannot be reached still opening the breaker. When the tool server was stopped mid-task Hermes dropped its tools ("Unknown tool") before the breaker came into it. That half is covered by the test of the patched check, where an error that did not come from a tool's own answer still counts.

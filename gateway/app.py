@@ -313,6 +313,57 @@ _TRACE_NONCE = uuid.uuid4().hex[:8]
 # Streaming poll cadence for the /v1/responses path — much faster than the background driver's 30s
 # because an open SSE connection wants timely deltas (and the fast poll also keeps the sandbox warm).
 RESP_POLL_S = float(os.environ.get("HARNESS_RESP_POLL_S", "1.2"))
+# How long one request for a turn's events may be held by the runner until it has something new
+# (GET /turn/{id}?wait=). The gateway used to ask every RESP_POLL_S, which put up to that long
+# before a turn's first text and again before its end (measured on the hosted service, 2026-10-05:
+# first output heard a median 1,249 ms after the runner had it, 225 ms with the hold). 0 asks the
+# old way.
+RESP_HOLD_S = float(os.environ.get("HARNESS_RESP_HOLD_S", "3"))
+
+
+class _Every:
+    """A turn's loop no longer turns once per RESP_POLL_S: it turns when the runner has something.
+    Duties that ran every N polls (the lease, the heartbeat, the durable cancel check) run every N
+    poll intervals of the clock instead. `at_once` names the duties whose first run is immediate;
+    the others first run one interval after `t0`."""
+
+    def __init__(self, t0: float, at_once: tuple[str, ...] = ()) -> None:
+        self._t0 = t0
+        self._last = {k: 0.0 for k in at_once}
+
+    def __call__(self, what: str, polls: int) -> bool:
+        now = time.time()
+        if now - self._last.get(what, self._t0) >= polls * RESP_POLL_S:
+            self._last[what] = now
+            return True
+        return False
+
+
+def _load_reasoning():
+    """runner/reasoning.py, by path: the levels a model has are kept with the functions that apply
+    them, and the two services share a tree, not an import path."""
+    import importlib.util
+    path = pathlib.Path(__file__).resolve().parents[1] / "runner" / "reasoning.py"
+    spec = importlib.util.spec_from_file_location("hr_reasoning", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# How much a model thinks on a turn: a level on the request (`reasoning.effort`), else the harness's
+# (`reasoning_effort`), else nothing, which leaves every request exactly as it was before levels.
+reasoning = _load_reasoning()
+
+
+def _reasoning_level(value, where: str = "") -> str:
+    """A level as the API takes it, "" for none given. A value that is not a level is refused when
+    it came with the request (`where` names the field) and read as none when it was stored."""
+    level = str(value or "").strip().lower()
+    if level and level not in reasoning.LEVELS:
+        if where:
+            raise HTTPException(400, f"{where} must be one of: {', '.join(reasoning.LEVELS)}")
+        return ""
+    return level
 # Output (container) files produced by a turn are capped to keep a single response bounded.
 RESP_MAX_FILES = int(os.environ.get("HARNESS_RESP_MAX_FILES", "25"))
 RESP_MAX_FILE_BYTES = int(os.environ.get("HARNESS_RESP_MAX_FILE_BYTES", str(25 * 1024 * 1024)))
@@ -513,7 +564,8 @@ def _req_hash(body: "CreateResponseBody") -> str:
     canon = {"model": body.model, "input": body.input, "instructions": body.instructions,
              "previous_response_id": body.previous_response_id, "backend": body.backend,
              "tools": body.tools, "max_output_tokens": body.max_output_tokens,
-             "max_step": body.max_step, "metadata": meta}
+             "max_step": body.max_step, "metadata": meta,
+             **({"reasoning": body.reasoning} if body.reasoning else {})}
     return hashlib.sha256(json.dumps(canon, sort_keys=True, default=str).encode()).hexdigest()
 
 REDIS_URL = os.environ.get("HARNESS_REDIS_URL", "")
@@ -964,10 +1016,14 @@ def _calibration_env(hv: dict | None, org: str, sid: str, timeout_s: int | None)
             "HR_CALIBRATION_TOKEN": _mint_calibration_token(sid, org, inner, ttl)}
 
 
-def _mint_turn_cred(sid: str, conn_name: str) -> str:
-    """Per-turn credential: sid.conn.exp.hmac — resolvable back to exactly one connection."""
+def _mint_turn_cred(sid: str, conn_name: str, level: str = "") -> str:
+    """Per-turn credential: sid.conn.exp.hmac — resolvable back to exactly one connection.
+
+    A fourth field names the thinking level the turn asked for, and is there only when it asked for
+    one: the broker keeps such a turn's thinking controls (see _strip_unsupported) and reads that
+    from the credential itself. A turn that asked for none carries the credential it always did."""
     exp = str(int(time.time()) + _BROKER_TTL_S)
-    body = f"{sid}|{conn_name}|{exp}"
+    body = f"{sid}|{conn_name}|{exp}" + (f"|{level}" if level else "")
     sig = hmac.new((INTERNAL_KEY or "dev-insecure").encode(), body.encode(), hashlib.sha256).hexdigest()
     return f"hrt_{base64.urlsafe_b64encode(body.encode()).decode().rstrip('=')}.{sig}"
 
@@ -979,13 +1035,25 @@ def _verify_turn_cred(tok: str) -> tuple[str, str] | None:
     try:
         b64, sig = tok[4:].rsplit(".", 1)
         body = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4)).decode()
-        sid, conn_name, exp = body.split("|")
+        sid, conn_name, exp = body.split("|")[:3]
     except Exception:  # noqa: BLE001 — malformed token is simply invalid
         return None
     good = hmac.new((INTERNAL_KEY or "dev-insecure").encode(), body.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig, good) or int(exp) < int(time.time()):
         return None
     return sid, conn_name
+
+
+def _turn_cred_level(tok: str) -> str:
+    """The thinking level a valid per-turn credential says its turn asked for, "" for none."""
+    if not _verify_turn_cred(tok):
+        return ""
+    try:
+        b64 = tok[4:].rsplit(".", 1)[0]
+        parts = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4)).decode().split("|")
+    except Exception:  # noqa: BLE001
+        return ""
+    return parts[3] if len(parts) > 3 and parts[3] in reasoning.LEVELS else ""
 
 
 # Every field in _AUTH_FIELDS that carries a credential. Removal is driven off THIS list, not off
@@ -998,7 +1066,7 @@ _SECRET_AUTH_FIELDS = ("api_key", "aws_access_key_id", "aws_secret_access_key",
 SANDBOX_TRUST = os.environ.get("HR_SANDBOX_TRUST", "").strip().lower()
 
 
-def _auth_from_conn(conn: dict, sid: str = "") -> dict | None:
+def _auth_from_conn(conn: dict, sid: str = "", effort: str = "") -> dict | None:
     """What the SANDBOX is allowed to see, or None if it cannot be given anything safely.
 
     The sandbox runs the customer's agent with real bash and network egress, so a provider
@@ -1030,7 +1098,12 @@ def _auth_from_conn(conn: dict, sid: str = "") -> dict | None:
     # exactly that shape: any condition that made brokering fail silently shipped the raw key.
     # Keeping pass-through as its own declared mode means a hosted deployment that leaves the
     # variable unset still fails CLOSED on every broker failure, as before.
-    if SANDBOX_TRUST == "owner":
+    #
+    # One connection is brokered even here: an Azure connection that signs in with Microsoft Entra
+    # (see _entra_token). What it holds is not a key to hand over but an application's secret that
+    # buys a token good for about an hour, and a turn may run for six: the broker asks again when
+    # the token ages, on every call, and the agent never holds the token or the secret.
+    if SANDBOX_TRUST == "owner" and not _entra_conn(conn):
         for field in _SECRET_AUTH_FIELDS:
             if conn.get(field) is not None:
                 out[field] = conn[field]
@@ -1043,13 +1116,16 @@ def _auth_from_conn(conn: dict, sid: str = "") -> dict | None:
         return None
     # Normalised: a connection saved as "TokenRouter" must not skip brokering on a casing mismatch.
     provider = str(conn.get("provider") or "").strip().lower()
-    if provider not in _BROKERABLE_PROVIDERS or not sid or not PUBLIC_BASE_URL:
+    # Where the sandbox reaches the broker: this gateway's own door beside a local runner, else the
+    # public base (see _sandbox_broker_origin). A self-hosted instance has the first without ever
+    # setting the second, and an Entra connection there is brokered all the same.
+    if provider not in _BROKERABLE_PROVIDERS or not sid or not _sandbox_broker_origin():
         log_reason = ("provider not brokerable" if provider not in _BROKERABLE_PROVIDERS
                       else "no session id" if not sid else "HARNESS_PUBLIC_BASE_URL unset")
         print(f"[broker] refusing to build sandbox auth for provider={provider!r}: {log_reason}",
               flush=True)
         return None
-    out["api_key"] = _mint_turn_cred(sid, str(conn.get("name") or ""))
+    out["api_key"] = _mint_turn_cred(sid, str(conn.get("name") or ""), effort)
     out["base_url"] = f"{_sandbox_broker_origin()}/v1/llm"
     return out
 
@@ -1097,7 +1173,8 @@ _IMAGE_MODEL_MAP_KEY = "harness-image-model-map"
 # measurement, this is policy, and one must not overwrite the other.
 _MEDIA_POLICY_KEY = "harness-media-policy"
 _IMAGE_MODEL_MAP_PREV_KEY = "harness-image-model-map.prev"
-_INTEGRATION_SECRET_FIELDS = ("api_key", "aws_bearer_token", "aws_secret_access_key", "aws_session_token")
+_INTEGRATION_SECRET_FIELDS = ("api_key", "aws_bearer_token", "aws_secret_access_key", "aws_session_token",
+                              "client_secret")   # an Entra application's secret (see _entra_token)
 # The hosted HarnessRouter service as a model provider. One origin, three routes: the provider
 # front door the runners call (OpenAI and Anthropic shapes and Gemini's native path, all under one
 # base), the model list it serves, and the connect flow that hands a key to this instance.
@@ -3006,6 +3083,26 @@ async def _drain_inflight() -> None:
             pass
 
 
+def _turn_harness_owned(principal: dict, hv: dict | None) -> None:
+    """A harness runs only for the organization that owns it, and for a caller narrowed to a
+    workspace (a workspace's key, the console's workspace) only when it is that workspace's
+    harness. Richard, 2026-10-06: "a harness can run by id and workspace's API key". Until then the
+    harness id alone was the run capability: anyone who knew it (console links carry it) ran the
+    harness with the owner's connected plugs and database, on the owner's connections. The rule was
+    made on the hosted service first, where no product relied on the old one, and is the same here.
+    A key for the whole organization runs any of its harnesses; a harness from before workspaces
+    belongs to the Default Workspace. Answered as not found, as every other route does for a harness
+    that is not the caller's, so the id reveals nothing."""
+    if not hv:
+        return                          # a base id: no record, no owner
+    if str(hv.get("org") or "") != str(principal.get("org") or ""):
+        raise uhp_error(404, "harness_not_found", "No harness with that id.", "harness_id")
+    ws = str(principal.get("workspace") or "")
+    default = bool(principal.get("workspace_default")) or ws.endswith("__hr_default")
+    if ws and not _workspace_keep(str(hv.get("workspace") or ""), ws, default):
+        raise uhp_error(404, "harness_not_found", "No harness with that id.", "harness_id")
+
+
 def _turn_harness_check(harness_id: str, hv: dict | None) -> None:
     """A turn addressed to a harness runs on THAT harness or not at all. A deleted one answers the
     same 404 as the read endpoints. An id that names no harness at all used to run as a turn with
@@ -3445,7 +3542,11 @@ _BROKER_HOP = ("host", "content-length", "connection", "keep-alive", "transfer-e
 #   rejects `output_config.effort` and `thinking.adaptive`; `context_management`'s only strategy
 #   is defined in terms of thinking, so it goes with it. These are model-version rejections, the
 #   same on the org's own key as on the platform's, so they are stripped for every provider that
-#   carries the Anthropic shape (Anthropic, Bedrock, TokenRouter, Vercel, LLMTR).
+#   carries the Anthropic shape (Anthropic, Bedrock, TokenRouter, Vercel, LLMTR). EXCEPT for a
+#   turn that ASKED for a thinking level (`reasoning.effort`, or the harness's): its controls were
+#   written for the model it runs on, by the relay or by the CLI's own switch (runner/reasoning.py),
+#   and removing them here ran the turn at the model's default while its record said the level had
+#   been applied (found on the hosted service, 2026-10-05).
 # * OpenAI-shape requests (`responses`, `responses/*`, `chat/completions`): nothing of the
 #   thinking group. `reasoning` carries Codex's effort and, on `responses/compact`, the
 #   `reasoning.context = all_turns` the compaction needs; TokenRouter and OpenRouter both take
@@ -3459,7 +3560,8 @@ _ANTHROPIC_THINKING_FIELDS = ("thinking", "context_management")
 _TIER_FIELDS = ("service_tier", "speed", "provider")
 
 
-def _strip_unsupported(body: bytes, provider: str = "", byok: bool = False, path: str = "") -> bytes:
+def _strip_unsupported(body: bytes, provider: str = "", byok: bool = False, path: str = "",
+                       keep_thinking: bool = False) -> bytes:
     """Remove what this request must not carry (see the rule above). Returns the body unchanged
     if it is not JSON — the broker must stay a dumb pipe for anything it does not positively
     understand."""
@@ -3473,14 +3575,15 @@ def _strip_unsupported(body: bytes, provider: str = "", byok: bool = False, path
         return body
     changed = False
     anthropic_shape = (path or "").strip("/").startswith("messages")
-    fields: tuple[str, ...] = _ANTHROPIC_THINKING_FIELDS if anthropic_shape else ()
+    strip_thinking = anthropic_shape and not keep_thinking
+    fields: tuple[str, ...] = _ANTHROPIC_THINKING_FIELDS if strip_thinking else ()
     if not byok:
         fields += _TIER_FIELDS
     for f in fields:
         if f in doc:
             doc.pop(f)
             changed = True
-    if anthropic_shape:
+    if strip_thinking:
         # `output_config` carries more than effort; drop only that key, and the object with it
         # if nothing else remains, so a provider never sees an empty container it may reject.
         oc = doc.get("output_config")
@@ -3831,6 +3934,15 @@ def _history_refusal(rec: dict, reason: str) -> str:
             f"produced under another route). Start a new task for {model}{keep}.")
 
 
+def _refusal_message(conn: dict | None, err: str) -> str:
+    """What a turn says when the provider refused the org's own connection. A connection that signs
+    in with Microsoft Entra has no key: what was refused is the application, by Entra (a wrong
+    directory, id or secret) or by the resource (no role on it), and the provider's words say which."""
+    provider = str((conn or {}).get("provider") or "your provider")
+    what = "connection" if str((conn or {}).get("auth") or "").strip().lower() == "entra" else "key"
+    return f"Your {provider} {what} was refused: {err or 'the provider returned an error'}"
+
+
 def _turn_failure_message(rec: dict) -> str:
     """What a failed turn says: the org's own key's refusal in plain words when that is why, else
     the last connection's reason in words. Never the tried list itself: its JSON, with our
@@ -3901,6 +4013,95 @@ def _provider_base_url(provider: str, base_url: str) -> str:
     return base
 
 
+# ── an Azure connection that signs in with Microsoft Entra instead of an API key ────────────────
+# An organization that does not issue API keys reaches Azure OpenAI and Foundry as an application
+# registered in its own directory: a tenant id, a client id and a client secret, held where a key is
+# held today and never handed to a sandbox. The broker asks Entra for a token for the Azure AI scope
+# (the client-credentials grant), keeps it until shortly before it expires, and presents it as the
+# bearer in place of the `api-key` header. Built on the hosted service first (2026-10-06) and taken
+# from there as it is; what differs here is only that such a connection is brokered in owner trust
+# too (see _auth_from_conn).
+_ENTRA_PROVIDERS = ("azure", "azure-foundry")
+_ENTRA_AUTHORITY = os.environ.get("HR_ENTRA_AUTHORITY", "https://login.microsoftonline.com").rstrip("/")
+_ENTRA_SCOPE = "https://cognitiveservices.azure.com/.default"
+_ENTRA_FIELDS = ("tenant_id", "client_id", "client_secret")
+_ENTRA_LABELS = {"tenant_id": "Directory (tenant) ID", "client_id": "Application (client) ID",
+                 "client_secret": "Client secret"}
+_ENTRA_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+_ENTRA_EARLY_S = 300          # a token is replaced this long before Entra would refuse it
+_entra_tokens: dict[str, tuple[str, float]] = {}
+_entra_locks: dict[str, asyncio.Lock] = {}
+
+
+def _entra_conn(conn: dict | None) -> bool:
+    return str((conn or {}).get("auth") or "").strip().lower() == "entra"
+
+
+def _entra_config_error(provider: str, cfg: dict) -> str:
+    """Why an integration's Entra settings cannot be saved, "" when they can."""
+    if provider not in _ENTRA_PROVIDERS:
+        return "Microsoft Entra sign-in is available for Azure OpenAI and Azure AI Foundry connections"
+    # In the words the form uses, since a person reads this beside the form.
+    missing = [_ENTRA_LABELS[f] for f in _ENTRA_FIELDS if not str(cfg.get(f) or "").strip()]
+    if missing:
+        return "missing the " + ", the ".join(missing)
+    for f in ("tenant_id", "client_id"):
+        if not _ENTRA_ID_RE.match(str(cfg[f]).strip()):
+            return f"the {_ENTRA_LABELS[f]} is written as a GUID, like 00000000-0000-0000-0000-000000000000"
+    if not str(cfg.get("base_url") or "").strip():
+        return "missing the Endpoint URL of the Azure resource"
+    return ""
+
+
+async def _entra_token(conn: dict) -> str:
+    """A bearer token for this connection's application, from Entra or from this process's memory."""
+    tenant, client, secret = (str(conn.get(f) or "").strip() for f in _ENTRA_FIELDS)
+    scope = str(conn.get("entra_scope") or _ENTRA_SCOPE).strip()
+    if not (tenant and client and secret):
+        raise HTTPException(502, "this connection signs in with Microsoft Entra and is missing its tenant id, client id or client secret")
+    k = hashlib.sha256(f"{tenant}|{client}|{scope}|{secret}".encode()).hexdigest()
+    hit = _entra_tokens.get(k)
+    if hit and hit[1] > time.time():
+        return hit[0]
+    async with _entra_locks.setdefault(k, asyncio.Lock()):
+        hit = _entra_tokens.get(k)
+        if hit and hit[1] > time.time():
+            return hit[0]
+        try:
+            r = await _client().post(f"{_ENTRA_AUTHORITY}/{tenant}/oauth2/v2.0/token", timeout=20.0,
+                                     data={"grant_type": "client_credentials", "client_id": client,
+                                           "client_secret": secret, "scope": scope})
+            doc = r.json() if r.content else {}
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"Microsoft Entra could not be reached for this connection's sign-in: {type(e).__name__}")
+        token = str((doc or {}).get("access_token") or "")
+        if r.status_code != 200 or not token:
+            # Entra's own code and first sentence (AADSTS7000215: Invalid client secret provided...)
+            # are what the person fixing the connection needs; neither carries the secret. Its
+            # trace and correlation ids follow on new lines or, for some codes, on the same one.
+            why = re.split(r"\s*(?:\r?\n|Trace ID:)", str((doc or {}).get("error_description") or (doc or {}).get("error")
+                                                         or f"HTTP {r.status_code}"), maxsplit=1)[0][:300]
+            if r.status_code in (400, 401, 403):
+                # A directory, application or secret Entra does not accept is this connection's own
+                # credentials being wrong: the same thing as a provider refusing an API key, and
+                # answered the same way. On a 502 Codex reconnected five times before giving up and
+                # a turn was free to try its next connection (measured 2026-10-06); on a 401 the
+                # agent stops and the turn says the connection was refused.
+                raise HTTPException(401, f"Microsoft Entra refused this connection's sign-in: {why}")
+            # Entra throttling or failing is not a refusal: a bad gateway, which may pass.
+            raise HTTPException(502, f"Microsoft Entra did not sign this connection in: {why}")
+        try:
+            life = max(60.0, float(doc.get("expires_in") or 3600) - _ENTRA_EARLY_S)
+        except (TypeError, ValueError):
+            life = 3000.0
+        _entra_tokens[k] = (token, time.time() + life)
+        # One line per sign-in (about one an hour per connection): what an operator looks for when a
+        # task says Entra refused it or a long task fails an hour in. The application's id is not a
+        # secret; nothing of the secret or the token is written.
+        print(f"[entra] signed in as application ••••{client[-4:]}; asking again in {int(life)} s", flush=True)
+        return token
+
+
 @app.api_route("/v1/llm/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def llm_broker(path: str, request: Request):
     claims = _verify_turn_cred(_broker_token(request))
@@ -3932,13 +4133,17 @@ async def llm_broker(path: str, request: Request):
     provider = str(conn.get("provider") or "")
     # Present the real credential the way THIS provider expects it.
     if provider in ("azure", "azure-foundry"):
-        headers["api-key"] = key
+        if _entra_conn(conn):
+            headers["authorization"] = f"Bearer {await _entra_token(conn)}"
+        else:
+            headers["api-key"] = key
     elif provider == "anthropic":
         headers["x-api-key"] = key
     else:
         headers["authorization"] = f"Bearer {key}"
 
-    body = _strip_unsupported(await request.body(), provider=provider, byok=True, path=suffix)
+    body = _strip_unsupported(await request.body(), provider=provider, byok=True, path=suffix,
+                              keep_thinking=bool(_turn_cred_level(_broker_token(request))))
     if provider == "google":
         body = _google_with_signatures(body, sid)
     if provider in _STRICT_GEMINI_CHANNELS and "gemini" in _body_model_name(body).lower():
@@ -4932,6 +5137,14 @@ _PROVIDER_CATALOG: dict[str, dict] = {
                     "placeholder": "https://<resource>.openai.azure.com/openai/v1"}],
         "secret": "api_key",
         "secret_label": "API Key",
+        # The other way in: as an application in the organization's own Microsoft Entra directory,
+        # for an organization that issues no API keys (see _entra_token). The form offers the choice
+        # and asks for these in place of the key.
+        "entra": {"fields": [{"key": "tenant_id", "label": "Directory (tenant) ID",
+                              "placeholder": "00000000-0000-0000-0000-000000000000"},
+                             {"key": "client_id", "label": "Application (client) ID",
+                              "placeholder": "00000000-0000-0000-0000-000000000000"}],
+                  "secret": "client_secret", "secret_label": "Client secret"},
     },
     "bedrock": {
         "label": "AWS Bedrock",
@@ -5087,6 +5300,7 @@ def _provider_catalog_public() -> list[dict]:
                     "secret": meta["secret"],
                     "secret_label": meta["secret_label"],
                     "key_hint": meta.get("key_hint", ""),
+                    **({"entra": meta["entra"]} if meta.get("entra") else {}),
                     "models": [{"canonical": c, "provider_id": v}
                                for c, v in _VENDOR_MODELS.get(pid, {}).items()],
                     # The custom provider's rows name any canonical; the form offers this list.
@@ -5314,6 +5528,20 @@ async def admin_integrations_put(body: IntegrationsBody, request: Request) -> di
                 if not prior_cfg.get(k):
                     raise HTTPException(400, f"integration '{name}': missing {k}")
                 cfg[k] = prior_cfg[k]
+        # How the connection signs in: an API key (nothing said, as before) or Microsoft Entra.
+        how = str(cfg.get("auth") or "").strip().lower()
+        if how in ("", "key", "api_key"):
+            # ...and a connection switched back to a key keeps nothing of the application it was
+            for k in ("auth", *_ENTRA_FIELDS, "entra_scope"):
+                cfg.pop(k, None)
+        elif how == "entra":
+            cfg = {**{k: (str(v).strip() if isinstance(v, str) else v) for k, v in cfg.items()}, "auth": "entra"}
+            cfg.pop("api_key", None)      # one way in per connection: a key left beside it would never be used
+            why = _entra_config_error(provider, cfg)
+            if why:
+                raise HTTPException(400, f"integration '{name}': {why}")
+        else:
+            raise HTTPException(400, f"integration '{name}': auth is \"key\" or \"entra\"")
         # A provider whose endpoint we know supplies its own base_url. Asking the user for a
         # value we can look up is a question with exactly one right answer and many wrong ones.
         known_base = (_PROVIDER_CATALOG.get(provider) or {}).get("base_url")
@@ -5545,6 +5773,9 @@ def _blocks_from_canonical(ev: dict) -> list[tuple[str, object]]:
     elif t == "result":
         out.append(("result", {"text": ev.get("result") or "", "usage": ev.get("usage"),
                                "is_error": bool(ev.get("is_error")),
+                               # the thinking level asked and the one applied (runner: _stamp_thinking);
+                               # absent for a turn that asked for none
+                               **({"reasoning": ev["reasoning"]} if ev.get("reasoning") else {}),
                                # the model the CLI reports it actually used, when it says (gemini-cli
                                # keys its stats by served model, and rewrites some ids on the way)
                                "model": str(ev.get("model") or "")}))
@@ -5601,6 +5832,9 @@ class _RespTranslator:
         # matrix read it per turn (a report that said "every turn record" was reading the session).
         self.connection = ""
         self.served_model = ""      # what the CLI reports it ran, when it reports; "" = unknown
+        # {"effort": asked, "applied": level | "default" | None}: None for a turn that asked for no
+        # level; "applied" is None until the runner's result says what the model was actually given.
+        self.reasoning: dict | None = None
         self.seq = 0
         self.out_index = -1
         self.output: list[dict] = []
@@ -5630,6 +5864,7 @@ class _RespTranslator:
                 "output": self.output, "store": self.store, "usage": self.usage,
                 "connection": self.connection,
                 "served_model": self.served_model,
+                "reasoning": self.reasoning,
                 "metadata": meta}
 
     def start(self) -> list[dict]:
@@ -5728,11 +5963,19 @@ class _RespTranslator:
         elif kind == "result":
             if payload.get("model"):
                 self.served_model = str(payload["model"])
+            r = payload.get("reasoning")
+            if isinstance(r, dict) and self.reasoning is not None:
+                self.reasoning = {"effort": self.reasoning.get("effort") or r.get("effort"),
+                                  "applied": r.get("applied") or "default"}
             u = payload.get("usage")
             if u:
                 self.usage = {"input_tokens": u.get("input_tokens", 0),
                               "output_tokens": u.get("output_tokens", 0),
                               "total_tokens": u.get("input_tokens", 0) + u.get("output_tokens", 0)}
+                # The provider's own count of thinking tokens, where it gave one (part of the
+                # output count, in the Responses API's place for it).
+                if u.get("reasoning_tokens") is not None:
+                    self.usage["output_tokens_details"] = {"reasoning_tokens": int(u["reasoning_tokens"] or 0)}
                 # Cache tokens, priced separately as cache_read/write. Accept both the claude CLI's
                 # raw names AND the runner's already-normalized cache_read_tokens/cache_write_tokens.
                 for src, dst in (("cache_read_input_tokens", "cache_read_tokens"),
@@ -5836,7 +6079,11 @@ def _parse_input(inp) -> tuple[str, list[dict], list[dict]]:
 
 def _route_backend(model: str | None, explicit: str | None) -> str:
     if explicit:
-        return explicit.lower()
+        # A base's id as GET /v1/bases lists it ("claude-code") or its backend ("claude"): the id
+        # was taken as the backend, matched no model, and every model was refused as having no
+        # provider there (found on the hosted service, 2026-10-05).
+        e = explicit.strip().lower()
+        return str((_BASE_CATALOG.get(e) or {}).get("backend") or e)
     m = (model or "").lower()
     if "hermes" in m:
         return "hermes"
@@ -7369,6 +7616,7 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                         resume: str | None, emit, model_req: str = "", user_text: str = "",
                         harness_id: str = "", max_step: int = 40,
                         timeout_s: int | None = None,
+                        effort: str = "",
                         hdr_vals: dict[str, str] | None = None,
                         partial_messages: bool = False, probe: dict | None = None,
                         codex_appserver: bool = False,
@@ -7508,6 +7756,9 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
             await _vertex_upsert(sid, {"models_seen": ",".join(seen + [model_req])})
     # Independent of which chat connection wins below: images are usually a different provider.
     image_auth = await _image_auth(sid, backend)
+    skills, skills_suppressed = _without_shadowing_image_skill(skills, skills_suppressed, image_auth, mcp_servers)
+    if "plugins" in rec:        # the record says what the turn was given, so after that change
+        rec["plugins"].update(skills=[s_.get("name") for s_ in skills], skills_off=skills_suppressed)
     vision_auth = await _vision_auth(sid, backend) if backend == "hermes" else None
     for name, pre in candidates:
         conn, src = (pre, "integration") if pre is not None else await _get_connection(org, name)
@@ -7535,7 +7786,7 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                 rec["tried"].append({"connection": name, "error": why})
                 continue
             conn = _chain_wired(conn, backend)
-        sandbox_auth = _auth_from_conn(conn, sid)
+        sandbox_auth = _auth_from_conn(conn, sid, effort)
         if sandbox_auth is None:
             # Refusing beats running: the only alternative is handing the sandbox a real provider
             # key. The chain moves on, and a fully unbrokerable chain fails the turn loudly.
@@ -7560,6 +7811,12 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                                  if backend == "gemini" and model_req else None),
                 "prompt": runner_prompt, "max_turns": max_step,
                 "timeout_seconds": timeout_s,
+                # How much the model thinks this turn; None asks nothing and changes nothing.
+                "reasoning_effort": effort or None,
+                # Which measured provider this connection is, read off its own base. The runner
+                # reads the base it is handed, and in broker trust that is this gateway's.
+                "reasoning_route": (reasoning.route_of(str((_with_provider_base(conn) or {}).get("base_url") or ""))
+                                    or None) if effort else None,
                 "auth": sandbox_auth, "resume_session_id": resume, "files": files_in,
                 "mcp_servers": mcp_servers, "skills": skills, "plugins": plugin_pkgs, "agent_doc": agent_doc,
                 "skills_suppressed": skills_suppressed, "tools_disabled": turn_tools_off,
@@ -7630,17 +7887,23 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
         else:
             await _vertex_upsert(sid, {"status": "running", "turn_status": "running",
                                        "last_connection": name, "runner_turn_id": rt or ""})
-        # cursor = durable fetch offset (only advances on an ack'd flush); fed_upto = how far
-        # events have been fed to the translator/emit (advances always) so a held-cursor re-fetch
-        # after a failed flush re-persists WITHOUT re-emitting duplicate output.
-        cursor, fed_upto, terminal, poll_fails, kill_sent, polls = 0, 0, None, 0, False, 0
+        # cursor = how far the durable trace has been written; fed_upto = how far events have been
+        # fed to the translator and emitted. Events are asked for from fed_upto, so nothing comes
+        # twice, and what is fed and not yet written waits in `pending`.
+        cursor, fed_upto, terminal, poll_fails, kill_sent = 0, 0, None, 0, False
+        pending: list = []
+        last_flush = time.time()
+        # A runner that holds the request says so in its answer; one that does not is paced by our
+        # own sleep, as before. The first request goes out at once either way.
+        held = RESP_HOLD_S > 0
+        every = _Every(time.time())
         while True:
-            await asyncio.sleep(RESP_POLL_S)
-            polls += 1
+            if not held:
+                await asyncio.sleep(RESP_POLL_S)
+            renew = every("renew", LEASE_RENEW_EVERY)
             # Heartbeat-renew the session lease so a long turn's lease never expires and gets
             # stolen by a follow-up (which would wipe this live workspace). Best-effort.
-            if (rec.get("lease_fence") and control_store.enabled()
-                    and polls % LEASE_RENEW_EVERY == 0):
+            if rec.get("lease_fence") and control_store.enabled() and renew:
                 try:
                     await control_store.lease_renew(org, sid, translator.resp_id,
                                                     rec["lease_fence"], LEASE_TTL_S)
@@ -7648,16 +7911,16 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                     pass
             # Renew the vertex heartbeat too, so the reconcile sweep sees a long turn as live (its
             # fresh-heartbeat fast path applies) instead of re-scanning trace chunks every cycle.
-            if polls % LEASE_RENEW_EVERY == 0:
+            if renew:
                 try:
                     await _vertex_upsert(sid, {"heartbeat": str(time.time())})
                 except Exception:  # noqa: BLE001
                     pass
             # Stop observed mid-turn (bypasses cancel_session's own sandbox call when that raced
-            # startup). The durable per-response latch is consulted every 10th poll so a cancel on
+            # startup). The durable per-response latch is consulted every tenth interval so a cancel on
             # any replica lands; the in-process flag is instant for a same-replica Stop.
             if not kill_sent and await _turn_cancelled(sid, org, translator.resp_id,
-                                                        check_store=(polls % 10 == 0)):
+                                                        check_store=every("cancel", 10)):
                 kill_sent = True
                 try:
                     await _sandbox_json(f"/turn/{rt}/cancel", sid, "POST", attempts=2)
@@ -7665,41 +7928,42 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                     terminal = "cancelled"   # sandbox unreachable — settle the turn terminally anyway
                     break
             try:
-                s = await _sandbox_json(f"/turn/{rt}", sid, "GET", params={"since": cursor}, attempts=3, base=2.0)
+                s = await _sandbox_json(f"/turn/{rt}", sid, "GET", attempts=3, base=2.0,
+                                        params={"since": fed_upto, **({"wait": RESP_HOLD_S} if RESP_HOLD_S > 0 else {})})
                 poll_fails = 0
             except Exception as e:  # noqa: BLE001
                 # a transient poll hiccup must not abort a live turn — only give up after a run
                 poll_fails += 1
+                held = False          # nothing held the request this time: pace the next one ourselves
                 if poll_fails >= 5:
                     rec["tried"].append({"connection": name, "error": f"poll: {str(e)[:150]}"})
                     break
                 continue
+            held = bool(s.get("held"))
             new = s.get("events") or []
-            n_total = s.get("n_total", cursor)
-            flush_ok = True
-            if new:
-                flush_ok = await _trace_flush(tr, {"events": new, "n_total": n_total})
-            # Feed/emit ONLY the slice not already fed — so a held-cursor re-fetch (after a failed
-            # flush) re-persists the events without re-emitting them into the response/stream.
+            n_total = s.get("n_total", fed_upto)
+            # Fed and emitted the moment they arrive. Asked for from fed_upto, so nothing comes twice.
             if new and n_total > fed_upto:
-                skip = fed_upto - cursor if fed_upto > cursor else 0
-                for cev in new[skip:]:
+                for cev in new:
                     for oev in translator.feed(cev):
                         await emit(oev)
                 fed_upto = n_total
-            # HR-INF-014: advance the DURABLE fetch cursor only once the events are acknowledged.
-            # On a failed flush we hold it so the next poll re-fetches and re-persists them (the
-            # durable trace is the authority and must not lose events). No events → advance.
-            if flush_ok or not new:
-                if new and flush_ok and cursor != n_total and control_store.enabled():
-                    # Persist the per-turn harvest cursor so a replica that ADOPTS this turn after we
-                    # die resumes at exactly the right sandbox index — no re-flush, no re-emit. Only
-                    # on a real advance (new events actually flushed), so it's ≤ once per poll batch.
-                    try:
-                        await control_store.resp_set_cursor(org, translator.resp_id, int(n_total))
-                    except Exception:  # noqa: BLE001 — advisory; adoption falls back to session-count
-                        pass
-                cursor = n_total
+                pending.extend(new)
+            # HR-INF-014: the durable trace is the authority and must not lose events. It is written
+            # once per interval rather than once per answer (a stream of token deltas would otherwise
+            # be a chunk each), and at the turn's end; a failed write keeps `pending` for the next.
+            # `cursor` is how far the trace has been written, and only that is persisted: a replica
+            # that ADOPTS this turn after we die asks the runner again from exactly there.
+            if pending and (s.get("done") or time.time() - last_flush >= RESP_POLL_S):
+                last_flush = time.time()
+                if await _trace_flush(tr, {"events": pending, "n_total": fed_upto}):
+                    pending = []
+                    if cursor != fed_upto and control_store.enabled():
+                        try:
+                            await control_store.resp_set_cursor(org, translator.resp_id, int(fed_upto))
+                        except Exception:  # noqa: BLE001 — advisory; adoption falls back to session-count
+                            pass
+                    cursor = fed_upto
             # Persist the CLI resume id ONLY when it CHANGES (HR-INF-010). The runner echoes
             # session_id on every poll (~1.2s), but it's set once per turn — an unconditional
             # upsert was ~1500 identical writes/turn to the shared partition. This loop is the
@@ -7740,6 +8004,8 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                                          # characters and 200 cut goose's tmp-dir panic at its path (2026-09-13).
                                          "error": (s.get("error") or s.get("result") or "")[:2000]})
                 break
+        if pending:   # the loop was left between two writes (a cancel, a poll that kept failing)
+            await _trace_flush(tr, {"events": pending, "n_total": fed_upto})
         _last_err = str(rec["tried"][-1].get("error") or "") if rec["tried"] else ""
         if (not terminal and rec["tried"] and rec["tried"][-1].get("connection") == name
                 and rec["tried"][-1].get("status") and _provider_refused(_last_err)):
@@ -7748,8 +8014,7 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
             # believed this one worked. On a self-hosted install every key is the operator's own,
             # so the rule is the refusal itself, not which store the key came from. Other failures
             # (a transient error, a timeout) still move on to the next connection.
-            provider = str(conn.get("provider") or "your provider")
-            rec["error_message"] = f"Your {provider} key was refused: {_last_err or 'the provider returned an error'}"
+            rec["error_message"] = _refusal_message(conn, _last_err)
             status = "failed"
             rec["status"] = "failed"
             await _vertex_upsert(sid, {"status": "failed", "turn_status": "failed", "last_connection": name})
@@ -8113,6 +8378,7 @@ class CreateResponseBody(BaseModel):
     backend: str | None = None     # non-OpenAI convenience: force codex|claude
     max_step: int | None = None         # per-request agent step budget (claude --max-turns)
     timeout_seconds: int | None = None  # per-request wall-clock cap for the turn
+    reasoning: dict | None = None       # {"effort": level}: how much the model thinks this turn (the Responses API's field)
 
 
 _IDEM_TERMINAL = {"completed", "failed", "incomplete", "cancelled", "error"}
@@ -8195,11 +8461,10 @@ async def create_response(body: CreateResponseBody, request: Request):
         raise uhp_error(403, "forbidden", "This credential starts runs on the one harness it drives.",
                         "metadata.harness_id", {"harness_id": _cal.get("inner")})
     hv = await _harness_vertex(harness_id) if harness_id else None
-    # A deleted harness cannot run new turns (same 404 as the read endpoints). Cross-org runs are
-    # ALLOWED — sibling products legitimately run a user's harness under a platform credential, and
-    # the marketplace model is exactly "callers run it, the owner pays infra". Until entitlements
-    # land, the unguessable harness id is the run capability.
+    # A deleted harness cannot run new turns (same 404 as the read endpoints), and a harness runs
+    # only for the organization and workspace that own it: see _turn_harness_owned.
     _turn_harness_check(harness_id, hv)
+    _turn_harness_owned(principal, hv)
     # The project layer this task reads: the request's, else the harness's. Resolved and checked
     # here, before anything is allocated, so a missing or unbuilt environment is a 4xx and not a
     # failed turn.
@@ -8245,6 +8510,10 @@ async def create_response(body: CreateResponseBody, request: Request):
                 or _num((hv or {}).get("max_step")) or DEFAULT_MAX_STEP)
     timeout_s = (_num(body.timeout_seconds) or _num(meta.get("timeout_seconds"))
                  or _num((hv or {}).get("timeout_seconds")) or DEFAULT_TIMEOUT_S)
+    # The turn's own level wins over the harness's; neither set, nothing is asked of the model.
+    effort = (_reasoning_level((body.reasoning or {}).get("effort") if isinstance(body.reasoning, dict) else body.reasoning,
+                               "reasoning.effort")
+              or _reasoning_level((hv or {}).get("reasoning_effort")))
     # Pin the backend to the harness's base (a custom harness always runs on its own backend);
     # only fall back to inferring it from the model name when there's no harness. This makes the
     # model permission check below meaningful — the requested model is validated against the
@@ -8384,6 +8653,8 @@ async def create_response(body: CreateResponseBody, request: Request):
         _ignored = [f for f in ("tools", "include") if getattr(body, f, None) is not None]
         tr = _RespTranslator(resp_id, model_req or body.model or backend, body.previous_response_id, body.store, created_at, sid=sid, ignored=_ignored)
         tr.environment = str((environment or {}).get("id") or "")
+        if effort:   # what the turn asked of the model's thinking; "applied" arrives with the result
+            tr.reasoning = {"effort": effort, "applied": None}
 
         # Broadcast a synthetic turn-start so the bus alone can render a conversation turn from
         # scratch (the native Responses events don't echo the user's prompt).
@@ -8431,7 +8702,7 @@ async def create_response(body: CreateResponseBody, request: Request):
                         tr, org=org, member=member, sid=sid, backend=backend, chain=chain,
                         prompt=prompt, files_in=files_in, resume=resume, emit=bus_emit_bg,
                         model_req=model_req, user_text=user_text, harness_id=harness_id,
-                        max_step=max_step, timeout_s=timeout_s, hdr_vals=hdr_vals,
+                        max_step=max_step, timeout_s=timeout_s, effort=effort, hdr_vals=hdr_vals,
                         partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment)
                     # A failed turn says why in the transcript, not only in the response record: fail()
                     # carries the message as an error event, which the console prints under the answer.
@@ -8481,7 +8752,7 @@ async def create_response(body: CreateResponseBody, request: Request):
                             tr, org=org, member=member, sid=sid, backend=backend, chain=chain,
                             prompt=prompt, files_in=files_in, resume=resume, emit=emit, model_req=model_req,
                             user_text=user_text, harness_id=harness_id, max_step=max_step,
-                            timeout_s=timeout_s, hdr_vals=hdr_vals, partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment)
+                            timeout_s=timeout_s, effort=effort, hdr_vals=hdr_vals, partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment)
                         # A failed turn says why in the transcript, not only in the response record: fail()
                         # carries the message as an error event, which the console prints under the answer.
                         for ev in (tr.fail(_turn_failure_message(rec)) if status == "failed" else tr.complete(status, produced)):
@@ -8539,7 +8810,7 @@ async def create_response(body: CreateResponseBody, request: Request):
                 tr, org=org, member=member, sid=sid, backend=backend, chain=chain,
                 prompt=prompt, files_in=files_in, resume=resume, emit=bus_emit, model_req=model_req,
                 user_text=user_text, harness_id=harness_id, max_step=max_step,
-                timeout_s=timeout_s, hdr_vals=hdr_vals, partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment)
+                timeout_s=timeout_s, effort=effort, hdr_vals=hdr_vals, partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment)
             # A failed turn says why in the transcript, not only in the response record: fail()
             # carries the message as an error event, which the console prints under the answer.
             for ev in (tr.fail(_turn_failure_message(rec)) if status == "failed" else tr.complete(status, produced)):
@@ -8814,6 +9085,8 @@ async def _session_turns_data(sid: str, limit: int = 0) -> dict:
                       "model": rec.get("model") or None,
                       # the model the CLI reported it ran, when it reported one
                       "served_model": rec.get("served_model") or None,
+                      # the thinking level the turn asked for and the one the model was given
+                      "reasoning": rec.get("reasoning") or None,
                       # WHY an incomplete turn is incomplete ("max_steps" | "timeout" |
                       # "interrupted"), so the console can say what actually happened instead of
                       # one banner for every cause. Absent on records from before the field.
@@ -13871,7 +14144,8 @@ _PLUG_GUIDES: dict[str, str] = {
         "## Vercel\n"
         "This task deploys the company's Vercel project through the `plugs` server. Its tools: "
         "{tools}. To deploy: put the code in the linked GitHub repository, then call "
-        "vercel_deploy_from_repo (name a ref for a preview; production true for production) and "
+        "vercel_deploy_from_repo (name a ref for a preview; production true for production; a "
+        "project's first deployment is production whatever is asked, and the tool says so) and "
         "report the url it returns; vercel_get_deployment and vercel_get_deployment_logs say how a "
         "deployment went, vercel_set_env sets an environment variable. There is no VERCEL_TOKEN, "
         "project id or team id in the environment and the `vercel` CLI is not signed in: do not "
@@ -15253,6 +15527,33 @@ def _base_takes_skills(base_id: str) -> bool:
     return bool((_BASE_CATALOG.get(str(base_id or "")) or {}).get("skills", True))
 
 
+_IMAGE_SKILL = "imagegen"
+
+
+def _without_shadowing_image_skill(skills: list[dict], suppressed: list[str], image_auth: dict | None,
+                                   mcp_servers: list[dict]) -> tuple[list[dict], list[str]]:
+    """The built-in image skill works only through the turn's image credential (HR_IMAGE_*); with
+    none its script refuses, "image generation is not configured for this Harness". On a harness
+    that also carries the media tools, an agent read the skill first, took that sentence as final
+    and told the person images were unavailable, with media_generate_image one call away (found on
+    the hosted service, a pi agent, two runs of three, 2026-10-06). So on such a turn the built-in
+    is dropped and suppressed: a path that cannot work must not stand in front of one that can.
+
+    Where the turn has no other way to make an image the skill stays, which is where this differs
+    from the hosted service: on a self-hosted instance the person asking is the operator, and the
+    skill's refusal is what says to add an integration that serves an image model. A harness's own
+    skill of that name (files of its own, or a plugin's) is the harness's and stays."""
+    builtin = (_builtin_skills().get(_IMAGE_SKILL) or {}).get("files")
+    media = _HOSTED_MCP_PREFIX + _MEDIA_SERVER
+    if image_auth or not builtin or not any(
+            str(s.get("url") or "").split("?", 1)[0].rstrip("/").endswith(media) for s in mcp_servers or []):
+        return skills, suppressed
+    if any(s.get("name") == _IMAGE_SKILL and (s.get("plugin") or s.get("files") != builtin) for s in skills):
+        return skills, suppressed
+    kept = [s for s in skills if s.get("name") != _IMAGE_SKILL]
+    return kept, (suppressed if _IMAGE_SKILL in suppressed else [*suppressed, _IMAGE_SKILL])
+
+
 def _builtin_default_skills(seen: set[str] | None = None) -> list[dict]:
     """Built-ins that are on by default, minus any the harness has its own entry for.
 
@@ -15787,6 +16088,7 @@ class HarnessBody(BaseModel):
     disabled_tools: list | None = _either("disabled_tools")     # built-in tool names the harness disabled
     max_step: int | None = _either("max_step")            # default agent step budget for this harness's turns
     timeout_seconds: int | None = _either("timeout_seconds")     # default per-turn wall-clock cap
+    reasoning_effort: str | None = _either("reasoning_effort")   # how much the model thinks on this harness's turns; a turn's own level wins
     additional_headers: list | None = _either("additional_headers")  # header NAMES callers may pass per request
     env: dict | None = None                 # variables every turn's shell and tools start with: name -> literal,
                                             # $headers.X-Name (a declared request header) or vault:ref
@@ -15832,6 +16134,7 @@ def _harness_out(v: dict) -> dict:
             "env": _parse_env(v.get("env")),
             "maxStep": int(v.get("max_step")) if str(v.get("max_step") or "").isdigit() else None,
             "timeoutSeconds": int(v.get("timeout_seconds")) if str(v.get("timeout_seconds") or "").isdigit() else None,
+            "reasoningEffort": _reasoning_level(v.get("reasoning_effort")),
             "calibrates": str(v.get("calibrates") or ""),
             "environment": str(v.get("environment") or ""),
             "member": v.get("member") or "", "workspace": v.get("workspace") or "", "createdAt": created}
@@ -15854,7 +16157,8 @@ def _harness_props(body: HarnessBody) -> dict:
             "calibrates": str(body.calibrates or "").strip(),
             "environment": str(body.environment or "").strip(),
             "max_step": str(body.max_step) if body.max_step else "",
-            "timeout_seconds": str(body.timeout_seconds) if body.timeout_seconds else ""}
+            "timeout_seconds": str(body.timeout_seconds) if body.timeout_seconds else "",
+            "reasoning_effort": _reasoning_level(body.reasoning_effort, "reasoning_effort")}
 
 
 _WS_WRITE_MAX = 4 * 1024 * 1024   # an app writing its own state, not an upload path
@@ -17719,6 +18023,7 @@ async def _cloud_harness_body(org: str, hid: str, v: dict, plugins_ok: bool = Fa
             **({"plugins": plugins} if plugins_ok else {}),
             "disabled_tools": out.get("disabledTools") or [], "max_step": out.get("maxStep"),
             "timeout_seconds": out.get("timeoutSeconds"), "additional_headers": out.get("additionalHeaders") or [],
+            "reasoning_effort": out.get("reasoningEffort") or None,
             "kit": out.get("kit") or None,
             "source": "selfhost", "source_instance": socket.gethostname()}
 
@@ -18055,7 +18360,10 @@ async def list_bases(request: Request) -> dict:
             "id": bid, "object": "harness.base", "label": b["label"], "backend": backend,
             "status": b["status"], "systemPrompt": b["system_prompt"],
             "defaultModel": cat.get("default", ""),
-            "models": [{"id": m["id"], "available": m["available"], "default": m["default"]}
+            # `reasoning`: the thinking levels the model has, lowest first; empty where none was
+            # measured, and the console offers no level there (runner/reasoning.py has the table).
+            "models": [{"id": m["id"], "available": m["available"], "default": m["default"],
+                        "reasoning": list(reasoning.levels_for(m["id"]))}
                        for m in view["models"]],
             "tools": [{"name": n, "label": lbl, "enforcement": b["tool_enforcement"]}
                       for n, lbl in b["tools"]],

@@ -371,6 +371,48 @@ offers you providers that work.
 </details>
 
 <details>
+<summary>An Azure connection without an API key (Microsoft Entra)</summary>
+
+For an organization that issues no API keys for its Azure resources. The connection is an application
+in your own Entra directory, and tasks sign in as that application.
+
+Register it once and give it a role on the resource it may call:
+
+```bash
+APP=$(az ad app create --display-name "HarnessRouter models" --sign-in-audience AzureADMyOrg --query appId -o tsv)
+az ad sp create --id "$APP" >/dev/null
+RESOURCE=$(az cognitiveservices account show -g <resource group> -n <resource name> --query id -o tsv)
+az role assignment create --assignee "$APP" --role "Cognitive Services OpenAI User" --scope "$RESOURCE"
+az ad app credential reset --id "$APP" --append --display-name harnessrouter --years 1 --query password -o tsv
+```
+
+The last line prints the client secret once. On the **Integrations** page add an **Azure OpenAI**
+connection, set **Sign in with** to **Microsoft Entra**, and enter the endpoint URL, the directory
+(tenant) ID, the application (client) ID and the client secret. A role assignment can take a few
+minutes to take effect.
+
+What happens on a task: the gateway asks Microsoft Entra for a token as the application, keeps it
+until shortly before it expires, and presents it on each model call in place of an API key. The agent
+holds neither the secret nor the token. That is true even though this image hands an API key
+connection straight to the agent (`HR_SANDBOX_TRUST=owner`): a token lives for about an hour and a
+task can run for longer, so a connection of this kind always goes through the gateway, which asks
+again as the token ages.
+
+When the sign-in is refused, the task fails with Entra's own reason, for example
+`Your azure connection was refused: ... Microsoft Entra refused this connection's sign-in: AADSTS90002: Tenant '...' not found`.
+When the application has no role on the resource, the reason is Azure's:
+`The principal ... lacks the required data action Microsoft.CognitiveServices/accounts/OpenAI/responses/write`.
+A directory or application ID that is not a GUID, or a missing secret, is refused when you save.
+
+The same role serves a Foundry resource (kind `AIServices`); its endpoint is
+`https://<resource>.services.ai.azure.com`. A connection reaches the models deployed on the resource
+under the names this instance knows them by.
+
+A sovereign cloud sets `HR_ENTRA_AUTHORITY` (default `https://login.microsoftonline.com`).
+
+</details>
+
+<details>
 <summary>What a backend with nothing connected says</summary>
 
 Forthcoming about it, which is what you get if you skip this step entirely:
@@ -906,6 +948,9 @@ docker build -t harnessrouter --build-arg WITH_BROWSER=1 .
 | `HR_SANDBOX_TRUST` | `owner` | You own the box, the agent and the key, so the key is handed over directly rather than brokered. |
 | `HARNESS_WORKSPACE` | `/data/workspaces` | One directory per session, on the volume, so a restart doesn't discard work in flight. |
 | `HR_WORKSPACE_TTL_HOURS` | `72` | Idle session workspaces are removed after this. They rehydrate from their checkpoint, so this costs time, not work. `0` keeps them forever. |
+| `HR_RELAY_UPSTREAM_TIMEOUT_S` | `600` | How long one model call may go without sending anything before the task is told the provider did not answer. Several model APIs send nothing while a model thinks (OpenAI's Chat Completions sends nothing at all), so a shorter wait cuts long thinking off. Lower it only if you would rather end a stuck call sooner than wait out a long think. It was `180` in 0.31.0 only. |
+| `HR_ENTRA_AUTHORITY` | `https://login.microsoftonline.com` | Where an Azure connection that signs in with Microsoft Entra asks for its token. A sovereign cloud names its own. |
+| `HARNESS_RESP_HOLD_S` | `3` | How long the gateway lets the runner hold a request for a turn's events. `0` asks every 1.2 s as before 0.30.1. |
 | `HARNESS_INTERNAL_KEY` | generated | Per-container; never leaves the process tree. |
 
 </details>
@@ -943,6 +988,9 @@ variables. It is a setup check, not a technical prerequisite for the API.
 3. Copy the secret shown once. Store it in your product backend's secret store or environment. The examples call this variable `HARNESSROUTER_API_KEY`.
 
 The key is scoped to the selected workspace and can be rotated or revoked on the same page.
+A harness runs with a key of its own workspace: a task that names a harness of another workspace,
+or of another organization, is answered `404 harness_not_found`, the same as an id that does not
+exist. A built-in base (`codex`, `claude-code`, ...) runs with any key.
 It is created in this self-hosted instance and authenticates requests to that CE deployment. It is
 neither a Cloud key, your Console password, nor the model-provider key configured
 in **Integrations**. Never put it in browser-side code or commit it to Git.
@@ -975,7 +1023,7 @@ To add a plugin to a harness that already exists, remember that `PUT /v1/harness
 the whole mutable configuration: any field you leave out is cleared, and an omitted `mcp_servers`
 also removes the hosted tools behind it. Read the harness first, then send back its current
 `system_prompt`, `default_model`, `mcp_servers`, `skills`, `disabled_tools`, `additional_headers`,
-`max_step` and `timeout_seconds` (the write body uses these snake_case names; the record you read
+`max_step`, `timeout_seconds` and `reasoning_effort` (the write body uses these snake_case names; the record you read
 uses camelCase) with the new package appended to `plugins`. Installed plugins round-trip as
 `{name, enabled, blob}`, so send those back unchanged and add the new one beside them.
 
@@ -1043,6 +1091,33 @@ A task you would rather not hold a connection for takes `"background": true`: th
 back at once with the task's id and `status: in_progress`, and `GET /v1/responses/{id}` reports
 it until it ends. Attached files land in the task's working directory under the name you give;
 a relative path in `filename` (`inputs/report.pdf`) puts the file in that folder.
+
+**How much the model thinks.** A task can say it, with the Responses API's own field:
+
+```bash
+curl -sS "$HR/api/harness/v1/responses" -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"input": "...", "metadata": {"harness_id": "hrn_..."}, "reasoning": {"effort": "low"}}'
+```
+
+The levels are `none`, `minimal`, `low`, `medium`, `high` and `xhigh`. A harness can keep a default
+for its tasks (`reasoning_effort` on the harness, the Thinking control on its settings page) and a
+task's own level wins. Models do not all have the same levels: `GET /v1/bases` lists, per base and
+model, the ones each has (`models[].reasoning`), and a model asked for a level it lacks gets the
+nearest one it has. A model that cannot be turned off gets its lowest level for `none`; a task
+that asked for some thinking is never given none. The response says what happened:
+
+```json
+"reasoning": {"effort": "minimal", "applied": "low"},
+"usage": {"output_tokens": 262, "output_tokens_details": {"reasoning_tokens": 248}}
+```
+
+`applied` is `"default"` when nothing could be set: the model has no measured level on the
+connection that served it, or the provider refused the level, in which case the call was made
+again without it rather than failed. `reasoning_tokens` is the provider's own count and is absent
+where the provider gives none. A task and a harness that set no level send what they sent before
+levels existed. Which setting moves which model on which provider was measured, not assumed; the
+table and the method are in [support-matrix-notes.md](support-matrix-notes.md), "How much a model
+thinks".
 
 <details>
 <summary>The rest of the surface</summary>

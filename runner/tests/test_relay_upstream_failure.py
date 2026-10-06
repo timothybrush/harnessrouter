@@ -200,9 +200,11 @@ def test_a_provider_that_goes_silent_is_reported_as_a_timeout_not_waited_on_fore
 
 def test_the_upstream_wait_is_bounded_below_the_turn_cap_and_no_shorter_than_it_ever_was(monkeypatch):
     """Under the cap, so a silent provider is reported by the relay rather than discovered by the
-    cap; and not under the 600 s this relay always waited, because a reasoning model answering a
-    non-streaming call is silent for minutes and that is an answer on its way. An instance with a
-    shorter cap of its own (the support-matrix suite's 600 s) sets the variable."""
+    cap; and not under the 600 s this relay always waited, because a model that thinks without
+    sending anything is an answer on its way. Measured 2026-10-06: OpenAI's Chat Completions API sent
+    no event in 430 s in 5 of 5 calls at the highest level, and most bases speak it. The default was
+    180 s for one release and cut exactly those. An instance with a shorter cap of its own (the
+    support-matrix suite's 600 s) sets the variable."""
     monkeypatch.delenv("HR_RELAY_UPSTREAM_TIMEOUT_S", raising=False)
     assert rs._relay_upstream_timeout() == 600
     assert rs._relay_upstream_timeout() < rs.MAX_TURN_SECONDS

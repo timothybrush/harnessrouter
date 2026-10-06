@@ -91,6 +91,7 @@ MCP             the tools an agent holds         how an agent calls it in a turn
 |---|---|
 | `POST /v1/memories` | Create a memory: `name`, `description`, `parent_id`, `restricted`, `provider` |
 | `GET /v1/memories?parent={id}` | The direct children of a memory, paginated. Without `parent`: where the caller enters the tree |
+| `GET /v1/memories?granted=true` | What the caller was given: where it was let in, and where below that it may do something else |
 | `GET /v1/memories/{id}` | One memory |
 | `PUT /v1/memories/{id}` | Rename it, describe it, restrict it, or move it by giving a new `parent_id` |
 | `DELETE /v1/memories/{id}` | Delete the memory, its records and its descendants |
@@ -100,6 +101,16 @@ it holds a privilege on whose parent it cannot see, so a caller granted one bran
 branch. A client that wants a subtree asks level by level, or passes `ancestor={id}` for every
 descendant it may read. A server MUST NOT return a memory on which the
 caller has no effective privilege, and MUST NOT reveal that one exists.
+
+Where a caller enters and what it was given are two questions. A caller that reads a memory and
+writes one of its children enters at the parent, and the listing does not show the child: it is
+one level. `granted=true` answers the second question in one request: every memory the caller may
+read whose parent it cannot see, and every memory below those on which what it may do differs from
+what it may do on the parent, each with the caller's privileges there, highest in the tree first.
+It is stated in what the caller may do and never in how a server keeps access, so the answer is
+the same whether the caller was let in by a grant of its own, through a group, or by a role. A
+client reads from it where the caller may write without walking the tree, and an agent's tools
+are built from it ([§9](#9-an-agent-and-its-memories)).
 
 ## 3. Access
 
@@ -182,7 +193,7 @@ A record is one thing a memory holds. Its `id` is the provider's and opaque to a
   "attributes": { "account": "acme" },
   "version": 2,
   "status": "active",
-  "supersedes": "hrec_11aa22bb33cc44dd55ee66ff77889900",
+  "supersedes": 1,
   "time": {
     "valid_from": "2026-09-30T00:00:00Z", "valid_to": null,
     "written_at": "2026-10-01T17:02:11Z", "invalidated_at": null
@@ -201,10 +212,11 @@ A record is one thing a memory holds. Its `id` is the provider's and opaque to a
 | `title` | One line that names the record: a document's heading, an entity's name, a fact's statement. Optional, at most 300 characters. A search matches it with the content. A record without one is named by how its content begins |
 | `content` | What the record says: an ordered list of parts, text and files ([§4.3](#43-content)). MAY be empty when the record has a title: a fact is often one sentence |
 | `attributes` | Structured fields. Free-form for core types; the type's schema for extension types ([§8](#8-types)) |
-| `version`, `status`, `supersedes` | A change appends a version and closes the one before it ([§5.3](#53-nothing-is-overwritten)). `status` is `active`, `superseded` or `forgotten` |
+| `version`, `status`, `supersedes` | A change appends a version and closes the one before it ([§5.3](#53-nothing-is-overwritten)). `version` counts from 1 and `supersedes` is the number of the version this one replaced, null on the first; a record keeps its `id` across versions. `status` is `active`, `superseded` or `forgotten` |
 | `time` | When it was true in the world (`valid_*`) and when the memory held it (`written_at`, `invalidated_at`). A provider without validity leaves `valid_*` null |
 | `written_by` | Who wrote it, `{ kind, id }` in the vocabulary of [§3](#who-acts-on-a-memory), stamped by the server from the authenticated caller; a client cannot supply it. When the provider wrote it, two more fields say why: `on_behalf_of`, the principal whose observation it was derived from, and `consolidation_id`, the run that concluded it ([§9.2](#92-consolidation-runs)) |
 | `references` | Other records this one points at ([§4.2](#42-references)) |
+| `follows` | Present only on a record the server derives from a source it keeps outside the memory: `{ kind, id, name }` of that source. Such a record is not revised or forgotten through the memory ([§5.4](#54-records-that-follow-a-source)) |
 | `trust` | Always `untrusted` on a read: what a memory returns is data, never instructions ([§13](#13-security)) |
 
 ### 4.1 Types
@@ -229,8 +241,11 @@ A reference names a record by `memory_id` and `record_id`. The two ends need not
 memory, or with the same provider.
 
 - A reference is resolved when it is **read**, with the reader's privileges. A reader without `read`
-  on the target memory receives `{ "memory_id", "record_id", "available": false }` and nothing
-  else.
+  on the target memory receives `{ "record_id", "available": false }` and nothing else: not what
+  the reference means, and not the id of the memory it leads into, since naming that memory would
+  say that it exists.
+- A reviser sets the references it can see. One it was shown as unavailable it can neither restate
+  nor remove: a server keeps it as it was through a revision by that caller.
 - Writing a reference does not require `read` on its target. A record promoted from a private
   memory into a shared one keeps its source, and only those who may read the source can follow it.
 
@@ -255,6 +270,9 @@ its own `derived_from` to the conversation it came from. A client MAY draw such 
 between its two entities, labelled with the fact's text or its `attributes.predicate`. A
 relationship with nothing to say, such as a section belonging to its document, is a bare reference
 and needs no record of its own.
+
+A record names at most one `subject` and at most one `object`. A statement about two subjects is
+two records; a server refuses a record that names a second of either with `memory_invalid`.
 
 A provider keeps the entities and relationships it has and no more
 ([§10.2](#102-the-capability-document)). One that keeps none still has a graph: its records and
@@ -358,6 +376,26 @@ copies nothing; reading `as_of` a snapshot's time is the same read.
 
 A provider declares how much of this it keeps, for content and for structure separately:
 `versions` (every version), `snapshots` (only between named points), or `none`.
+
+### 5.4 Records that follow a source
+
+A server may keep something outside the memory and show it in the memory as records: a document
+people write in an editor, shown as one record for each of its sections. Such a record carries
+`follows`, which names where it comes from:
+
+```json
+"follows": { "kind": "document", "id": "doc_41c0…", "name": "Engineering guide" }
+```
+
+It changes when its source changes, by the server's own hand. It is not revised or forgotten
+through the memory, because the next change of its source would undo that. A server refuses
+`revise` and `forget` on it with `memory_unsupported`, in words that say where the source is
+changed, and a client offers neither on a record that carries `follows`. In every other way it is
+a record like any other: it is read, recalled and referenced, and its versions are kept as the
+provider declares.
+
+A file someone kept is not such a record. Its title and the line that says what the file shows are
+its writer's own statement, so it is revised and forgotten like any record ([§7](#7-files)).
 
 ## 6. Recall
 
@@ -527,7 +565,7 @@ draws them or an agent that asks what something is connected to.
       "to":   { "memory_id": "hmem_55d1…", "record_id": "hrec_dana…" },
       "rel": "subject", "available": true },
     { "from": { "memory_id": "hmem_55d1…", "record_id": "hrec_job…" },
-      "to":   { "memory_id": "hmem_9f02…", "record_id": "hrec_77a1…" },
+      "to":   { "record_id": "hrec_77a1…" },
       "available": false }
   ],
   "truncated": false,
@@ -539,7 +577,8 @@ draws them or an agent that asks what something is connected to.
   `from` the record that holds it, `to` the record it names.
 - Records are looked for in this memory and in what is below it that the caller may read, as a
   search does. An edge may lead into any memory. Its target is a node only when the caller may
-  read it; otherwise the edge is returned with `"available": false` and without its `rel`, and the
+  read it; otherwise the edge is returned with `"available": false`, without its `rel` and without the
+  memory its target is in, and the
   target is not a node. This is the rule of [§4.2](#42-references), unchanged.
 - `truncated` is `true` when there were more nodes than `limit`. `degraded` says what was cut
   short, as a search's does.
@@ -552,6 +591,10 @@ A file enters a memory as a part of a record's content ([§4.3](#43-content)): u
 [Files](files.md) says, named in the part by its id, and read back at the part's own address. A
 revision whose content names other files is a new version of the record; the earlier version keeps
 naming the files it had, for as long as the provider keeps history and the server keeps the files.
+
+Forgetting a record that holds a file closes it like any other: the file leaves every read that
+does not ask for history, and is still there for one that does. `erase` removes the bytes too, and
+names a copy it could not remove in `unreachable`.
 
 `content.bytes` in the provider's capability document says where the bytes live: `kept` when the
 provider stores them itself, `referenced` when it keeps the reference and the bytes stay with the
@@ -628,7 +671,11 @@ A harness adds two settings of its own:
   agent writes is stamped with it.
 - `data` is read off the grants, never stored on the harness: every memory the agent holds a grant
   on, highest in the tree first. It is where the agent starts. From each it reaches everything
-  below, and nothing above that it was not granted.
+  below, and nothing above that it was not granted. A server that runs the agent and does not
+  keep its memories asks the server that does, as the agent, with `GET /v1/memories?granted=true`
+  ([§2](#2-the-memory-object)). It MUST NOT build an agent's tools from the plain listing, which
+  names only where the agent enters: an agent that reads a memory and writes one below it would
+  be offered nothing to write with.
 - `default_memory_id` is where an unaddressed `remember` goes and where turns are recorded. It MUST
   be a memory the agent may write; a server refuses one it may not, with `memory_invalid`.
 - `observe`, on by default, records each finished turn in the default memory as an episode.
