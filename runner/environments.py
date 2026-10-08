@@ -35,6 +35,7 @@ import json
 import mimetypes
 import platform
 import pwd
+import ipaddress
 import re
 import os
 import pathlib
@@ -463,7 +464,34 @@ def _copy_without_links(src_root: str, dst: pathlib.Path) -> tuple[int, int]:
     return written, skipped
 
 
-def import_git(env_id: str, url: str, ref: str = "", *, replace: bool = False) -> dict:
+def _git_pin_args(url: str, pin: str) -> list[str]:
+    """`git -c` settings that make the clone connect to the address the gateway classified.
+
+    `pin` is "<host>:<port>:<address>" from the gateway, on a deployment shared by several
+    organizations; empty otherwise. Without it git resolved the name again when it connected, so a
+    name that answered a public address to the gateway's check and an internal one a moment later
+    reached the internal one. Over http(s), curl is told the address for that host and port, and
+    redirects are not followed (one to another host would be resolved afresh); over ssh, ssh
+    connects to the address and still checks the host key under the name."""
+    if not pin:
+        return []
+    host, _, rest = pin.partition(":")
+    port, _, addr = rest.partition(":")
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        raise HTTPException(400, "git pin is not host:port:address")
+    if not (host and port.isdigit()):
+        raise HTTPException(400, "git pin is not host:port:address")
+    if url.startswith(("https://", "http://")):
+        shown = f"[{ip}]" if ip.version == 6 else str(ip)
+        return ["-c", f"http.curloptResolve={host}:{port}:{shown}", "-c", "http.followRedirects=false"]
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        raise HTTPException(400, "git pin names an invalid host")
+    return ["-c", f"core.sshCommand=ssh -o HostName={ip} -o HostKeyAlias={host}"]
+
+
+def import_git(env_id: str, url: str, ref: str = "", *, replace: bool = False, pin: str = "") -> dict:
     """Clone a repository's tree (shallow, one ref) into the source, without its .git. As with an
     archive, only regular files and directories land: a link the repository commits is dropped and
     counted, never followed. The copy runs as root, and following a committed link (say, to
@@ -473,7 +501,8 @@ def import_git(env_id: str, url: str, ref: str = "", *, replace: bool = False) -
     if not str(url).startswith(("https://", "http://", "git@", "ssh://")):
         raise HTTPException(400, "git url must be https://, http://, ssh:// or git@")
     with tempfile.TemporaryDirectory(prefix="hr-env-git-") as tmp:
-        cmd = ["git", "clone", "--depth", "1", "--quiet"] + (["--branch", ref] if ref else []) + [url, tmp + "/repo"]
+        cmd = (["git"] + _git_pin_args(url, pin) + ["clone", "--depth", "1", "--quiet"]
+               + (["--branch", ref] if ref else []) + [url, tmp + "/repo"])
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600,
                            env={**_tool_env(), "GIT_TERMINAL_PROMPT": "0"})
@@ -979,15 +1008,24 @@ def ensure_mount(env_id: str, slug: str) -> str:
     return link
 
 
-def drop_mount(slug: str) -> None:
-    link = mount_path(slug)
-    if os.path.islink(link):
-        os.unlink(link)
+def drop_mount(slug: str, env_id: str = "") -> None:
+    """Take the path down. Given the environment, only while the path is still that environment's:
+    a deleted environment's name is free at once, and another environment may hold it by the time
+    this one is removed for good."""
+    base = os.path.realpath(ENV_MOUNT)
+    link = os.path.normpath(os.path.join(base, str(slug or "")))
+    if not slug_ok(slug) or not link.startswith(base + os.sep):
+        raise HTTPException(400, "environment slug is not a path segment")
+    if not os.path.islink(link):
+        return
+    if env_id and os.readlink(link) != str(active_link(env_id)):
+        return
+    os.unlink(link)
 
 
 def delete_environment(env_id: str, slug: str = "") -> dict:
     if slug:
-        drop_mount(slug)
+        drop_mount(slug, env_id)
     d = env_dir(env_id)
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
@@ -1096,7 +1134,9 @@ def r_delete(env_id: str, path: str) -> dict:
 @router.post("/environments/{env_id}/import")
 async def r_import(env_id: str, request: Request, replace: int = 0, git_url: str = "", git_ref: str = "") -> dict:
     if git_url:
-        return import_git(env_id, git_url, git_ref, replace=bool(replace))
+        # git_pin: host:port:address the gateway classified, on a shared deployment (_git_pin_args)
+        return import_git(env_id, git_url, git_ref, replace=bool(replace),
+                          pin=str(request.query_params.get("git_pin") or ""))
     fd, spool = tempfile.mkstemp(prefix="hr-env-import-")
     try:
         with os.fdopen(fd, "wb") as out:
@@ -1154,6 +1194,13 @@ def r_activate(env_id: str, version: int, slug: str) -> dict:
 @router.delete("/environments/{env_id}")
 def r_delete_env(env_id: str, slug: str = "") -> dict:
     return delete_environment(env_id, slug)
+
+
+@router.delete("/environments/{env_id}/mount")
+def r_unmount_env(env_id: str, slug: str) -> dict:
+    """A deleted environment, kept for 30 days: its files stay, its path goes."""
+    drop_mount(slug, env_id)
+    return {"id": env_id, "mounted": False}
 
 
 @router.get("/environments/{env_id}")

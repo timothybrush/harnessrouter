@@ -363,3 +363,64 @@ def test_a_git_import_lands_files_and_directories_and_never_follows_a_link(store
     assert os.stat(src / "src" / "run.sh").st_mode & 0o111
     assert "HR_SECRET_KEY" not in seen["env"] and "HARNESS_INTERNAL_KEY" not in seen["env"]
     assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_a_deleted_environment_takes_down_only_its_own_path(store):
+    """Deleting keeps the files for 30 days and frees the name at once; by the time the files go,
+    another environment may be mounted under that name, and its path must stay."""
+    def point(env_id, slug):
+        E.env_dir(env_id).mkdir(parents=True, exist_ok=True)
+        os.makedirs(E.ENV_MOUNT, exist_ok=True)
+        link = E.mount_path(slug)
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(str(E.active_link(env_id)), link)
+
+    a, b = "henv_" + "a" * 32, "henv_" + "b" * 32
+    point(a, "data")
+    E.drop_mount("data", a)                      # the delete: its path goes, its files stay
+    assert not os.path.lexists(E.mount_path("data")) and E.env_dir(a).is_dir()
+    point(b, "data")                             # the name is taken by another environment
+    E.drop_mount("data", a)
+    E.delete_environment(a)                      # the sweep, 30 days later: no name given
+    assert os.readlink(E.mount_path("data")) == str(E.active_link(b))
+    assert not E.env_dir(a).exists()
+
+
+def test_taking_a_path_down_refuses_a_name_that_is_not_one_segment(store):
+    for slug in ("../outside", "a/b", "", ".."):
+        with pytest.raises(HTTPException):
+            E.drop_mount(slug, "henv_" + "a" * 32)
+
+
+def test_a_pinned_git_clone_connects_to_the_address_the_gateway_classified(store, monkeypatch):
+    """On a shared deployment the gateway hands over host:port:address; git must not resolve the
+    name again when it connects (a DNS rebind), nor follow a redirect to a name it would resolve."""
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        os.makedirs(cmd[-1], exist_ok=True)
+        pathlib.Path(cmd[-1], "README.md").write_text("hi\n")
+        return None
+    monkeypatch.setattr(E.subprocess, "run", fake_run)
+    E.import_git("henv_" + "c" * 32, "https://git.example/team/repo.git", pin="git.example:443:140.82.112.3")
+    E.import_git("henv_" + "c" * 32, "git@git.example:team/repo.git", pin="git.example:22:140.82.112.3")
+    E.import_git("henv_" + "c" * 32, "https://git.example/team/repo.git")
+    https, ssh, unpinned = seen
+    assert https[:5] == ["git", "-c", "http.curloptResolve=git.example:443:140.82.112.3",
+                         "-c", "http.followRedirects=false"]
+    assert ssh[:3] == ["git", "-c", "core.sshCommand=ssh -o HostName=140.82.112.3 -o HostKeyAlias=git.example"]
+    assert unpinned[:2] == ["git", "clone"]
+    # through the route, as the gateway sends it
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    app.include_router(E.router)
+    r = TestClient(app).post(f"/environments/henv_{'c' * 32}/import",
+                             params={"git_url": "https://git.example/team/repo.git", "git_pin": "git.example:443:140.82.112.3"})
+    assert r.status_code == 200 and seen[-1][:3] == ["git", "-c", "http.curloptResolve=git.example:443:140.82.112.3"]
+    for bad in ("git.example:443:not-an-address", "git.example::140.82.112.3", "a b:22:140.82.112.3"):
+        with pytest.raises(HTTPException):
+            E.import_git("henv_" + "c" * 32, "git@git.example:team/repo.git" if " " in bad else
+                         "https://git.example/team/repo.git", pin=bad)

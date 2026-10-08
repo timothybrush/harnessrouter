@@ -37,6 +37,7 @@ import subprocess
 import tarfile
 import tempfile
 
+import httpcore
 import httpx
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
@@ -4993,8 +4994,8 @@ async def get_trace_all(sid: str, request: Request, compact: int = 0) -> Respons
 @app.delete("/v1/sessions/{sid}")
 @app.delete("/v1/traces/{sid}")
 async def delete_trace(sid: str, request: Request) -> dict:
-    """Delete a session for good: its trace manifest + event chunks, its durable workspace
-    tarball, and tombstone the session vertex. /v1/sessions/{sid} is the protocol's name for it;
+    """Delete a session for good, at once: everything it left (`_session_purge`), and its record
+    reduced to a marker that holds no content. /v1/sessions/{sid} is the protocol's name for it;
     /v1/traces/{sid} is the older path the Traces app calls, the same handler."""
     p = await _principal(request)
     org = str(p.get("org") or "")
@@ -5019,7 +5020,8 @@ async def delete_trace(sid: str, request: Request) -> dict:
         # serving the full conversation. Sessions §6 says deletion MUST make the session
         # unreadable, and the published link is the reader its owner is least likely to remember.
     try:
-        await _vg_upsert("HarnessSession", sid, {"status": "deleted", "shared": "0"})
+        await _vg_upsert("HarnessSession", sid, {"status": "deleted", "shared": "0",
+                                                 "deleted_at": str(_now_ms())})
     except Exception:  # noqa: BLE001
         pass
     # Clear local token lookups as well. Every public read checks durable share state, so
@@ -5032,7 +5034,64 @@ async def delete_trace(sid: str, request: Request) -> dict:
             await _stop_session(org, sid, v)
         except Exception:  # noqa: BLE001
             pass
-    base = await _trace_base(sid)
+    await _session_purge(sid, v)
+    await _session_strip(sid, v)
+    # drop in-process state (the vertex was tombstoned first, above)
+    _SHARE_TOKEN_CACHE.clear()
+    _session_trace.pop(sid, None)
+    return {"id": sid, "object": "session", "deleted": True}
+
+
+# What a deleted session's marker keeps: the ids that find what it left, and nothing a person
+# wrote. A finalize or a reconcile can land after the delete, and the tombstone is what refuses
+# them (`_session_write_allowed`, `_index_put`); the retention sweep removes the marker a day later,
+# after purging again whatever such a late write managed to put back.
+_SESSION_MARKER = ("tenant", "workspace", "harness_id", "member_id", "member", "created_at_inv",
+                   "trace_blob", "status", "shared", "deleted_at")
+
+
+async def _session_strip(sid: str, v: dict | None) -> None:
+    """Reduce a deleted session's record to its marker. The store merges on write, so the record
+    is removed and the marker written fresh; a write landing between the two is a status write
+    the next sweep strips again."""
+    cur = await BACKING.graph.get(sid) or dict(v or {})
+    keep = {k: str(cur.get(k) or "") for k in _SESSION_MARKER if cur.get(k)}
+    keep.update({"status": "deleted", "shared": "0"})
+    keep.setdefault("deleted_at", str(_now_ms()))
+    with contextlib.suppress(Exception):
+        await BACKING.graph.delete(sid, "HarnessSession")
+    with contextlib.suppress(Exception):
+        await BACKING.graph.upsert("HarnessSession", sid, keep)
+
+
+async def _session_records(label: str, field: str, sid: str, index: dict | None) -> list[str]:
+    """The ids of one kind of record a session owns. The sweep hands in an index it built once:
+    a lookup by property reads every record of the label, and a volume with thousands of deleted
+    sessions would otherwise read every response once per session."""
+    if index is not None:
+        return list(index.get(label, {}).get(sid, ()))
+    return [str(r["id"]) for r in await BACKING.graph.find(label, {field: sid}) if r.get("id")]
+
+
+async def _session_index() -> dict:
+    """Every session's responses and plugin calls, by session id, in one read of each label."""
+    idx: dict = {}
+    for label, field in (("HarnessResponse", "session_id"), (_PLUG_CALL_LABEL, "session")):
+        by: dict[str, list[str]] = {}
+        for r in await BACKING.graph.find(label):
+            if r.get(field) and r.get("id"):
+                by.setdefault(str(r[field]), []).append(str(r["id"]))
+        idx[label] = by
+    return idx
+
+
+async def _session_purge(sid: str, v: dict | None, index: dict | None = None) -> None:
+    """Everything a session left, removed: its transcript and trace, its responses, the files its
+    tasks produced, their previews and change list, its media, the record of every plugin call it
+    made, its checkpoint and its live working folder. Richard's rule (2026-10-08, the same on the
+    hosted service): deleting a task removes it at once and for good. Idempotent, so the retention
+    sweep runs it again for every marker before removing the marker."""
+    base = _prefix_from_vertex(sid, v)
     # 1) trace manifest + event chunks (drives the Recents/Traces list)
     if base:
         manifest = {}
@@ -5054,7 +5113,25 @@ async def delete_trace(sid: str, request: Request) -> dict:
         # remove the flat index AND the per-harness/per-member mirrors (harness/member from the
         # manifest we just read; falls back to a bare flat-key delete if the manifest was unreadable)
         await _deindex_manifest(base, manifest, _session_trace.get(sid) or {}, v or {})
-    # 2) durable session workspace tarball, and anything the media server holds for it
+    # 2) its responses. Response §7 keeps a response deleted on its own for 30 days; a response
+    # of a deleted session goes with the session.
+    with contextlib.suppress(Exception):
+        for rid in await _session_records("HarnessResponse", "session_id", sid, index):
+            _resp_cache_forget(rid)
+            await _blob_delete(f"responses/{rid}.json", kb=RESP_BLOB_KB)
+            await BACKING.graph.delete(rid, "HarnessResponse")
+    # 3) everything stored under its id: the checkpoint and the media scene (sessions/<sid>/ in
+    # the session store), the change list (sessions/<sid>/ in the response store), the files its
+    # tasks produced (containers/<sid>/) and their rendered previews (previews/<sid>/)
+    for kb, prefix in ((BLOB_KB, f"sessions/{sid}/"), (RESP_BLOB_KB, f"sessions/{sid}/"),
+                       (RESP_BLOB_KB, f"containers/{sid}/"), (RESP_BLOB_KB, f"previews/{sid}/")):
+        with contextlib.suppress(Exception):
+            for it in await _blob_list_all(prefix, kb=kb):
+                await _blob_delete(str(it.get("file_id") or ""), kb=kb)
+        purge = getattr(BACKING.blob, "purge", None)       # what a listing does not show
+        if purge:
+            with contextlib.suppress(Exception):
+                await purge(kb, prefix)
     await _blob_delete(_ws_blob(sid), kb=BLOB_KB)
     # The live working folder is the session's memory on this box (the tarball above is its
     # durable copy); §6 says deletion frees it. Only the runner can remove it: the folder belongs
@@ -5066,10 +5143,10 @@ async def delete_trace(sid: str, request: Request) -> dict:
         except Exception:  # noqa: BLE001
             pass
     await _media_session_purge(sid)
-    # 3) drop in-process state (the vertex was tombstoned first, above)
-    _SHARE_TOKEN_CACHE.clear()
-    _session_trace.pop(sid, None)
-    return {"id": sid, "object": "session", "deleted": True}
+    # 4) the record of every plugin call it made
+    with contextlib.suppress(Exception):
+        for cid in await _session_records(_PLUG_CALL_LABEL, "session", sid, index):
+            await BACKING.graph.delete(cid, _PLUG_CALL_LABEL)
 
 
 # ── connection admin (org admins manage their own provider connections) ──────────
@@ -5809,6 +5886,10 @@ async def put_policy(org: str, backend: str, body: PolicyBody) -> dict:
 
 def _rid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 async def _vg_upsert(label: str, vid: str, props: dict, *, raise_on_fail: bool = False) -> None:
@@ -8332,6 +8413,308 @@ async def _owned_org(request: Request, org: str) -> dict:
     return p
 
 
+# ── retention: when what was deleted is removed ──────────────────────────────────────────────
+# Richard's rule (2026-10-08), the hosted service's too, and published in the self-hosting guide:
+#   for good, at once:          tasks (sessions, with everything they left), API keys, credentials
+#   30 days, restorable, gone:  harnesses, responses deleted on their own, environments, uploads
+# Each delete does its own "at once" part. This sweep removes what has come due: what a delete
+# could not finish, the marker a deleted session keeps for a day, and every 30-day kind past its
+# 30 days. It runs when the server starts and every day after, so the first start of a version
+# that has it removes everything a volume already held marked deleted for longer than 30 days
+# (Richard, 2026-10-08: "remove old ones at once"). A record marked before delete times were
+# written counts from its last write, and the answer says how many did.
+#
+# The shapes are the hosted service's (POST /internal/retention/sweep and /restore), so one
+# operator tool reads both. Arenas and accounts are hosted kinds; this server has neither.
+_RETAIN_MS = 30 * 86_400_000
+_MARKER_MS = 86_400_000
+_RETENTION_SWEEP_S = int(os.environ.get("HR_RETENTION_SWEEP_S", "86400"))
+_RETENTION_KINDS = ("sessions", "responses", "harnesses", "api_keys", "environments", "uploads", "credentials")
+_FOR_GOOD = frozenset({"sessions", "api_keys", "credentials"})
+
+
+def _stamp_ms(v) -> int:
+    """A time as any version wrote it, in milliseconds: seconds or milliseconds, a number or its
+    text. 0 when there is none."""
+    try:
+        f = float(str(v if v is not None else "").strip() or 0)
+    except ValueError:
+        return 0
+    return int(f * 1000) if 0 < f < 1e11 else int(f)
+
+
+def _true(v) -> bool:
+    return str(v) in ("1", "true", "True")
+
+
+async def _retention_due(kind: str, now: int) -> tuple[list[dict], int]:
+    """The items of one kind that are due, oldest first, each {"id", "row"}; and how many of them
+    had no delete time of their own."""
+    rows: list[tuple[int, bool, dict]] = []      # (counted-from time, had a delete time, row)
+
+    def add(row: dict, at_field: str, *fallbacks: str) -> None:
+        at = _stamp_ms(row.get(at_field))
+        own = at > 0 or kind in ("api_keys", "credentials")   # due at once: no clock to count from
+        for f in fallbacks:
+            if at:
+                break
+            at = _stamp_ms(row.get(f))
+        rows.append((at, own, row))
+
+    if kind == "sessions":
+        # A session deleted before this version has no delete time and everything it left still
+        # beside it: due at once, since a task's delete is for good.
+        for r in await BACKING.graph.find("HarnessSession", {"status": "deleted"}):
+            add(r, "deleted_at")
+        due = [(at, own, r) for at, own, r in rows if not at or now - at >= _MARKER_MS]
+    elif kind == "api_keys":
+        for r in await BACKING.graph.find("HarnessApiKey"):
+            if _true(r.get("revoked")) or r.get("kind") != "harness_api_key":
+                add(r, "revoked_at")
+        due = rows
+    elif kind == "credentials":
+        for r in await BACKING.graph.find(_CONNECTION_LABEL, {"deleted": "1"}):
+            add(r, "deleted_at", "updated_at")
+        blank = getattr(BACKING.secrets, "blank", None)
+        if blank:
+            for tenant, name in await blank():
+                rows.append((0, True, {"id": f"secret:{tenant}/{name}", "tenant": tenant, "name": name}))
+        due = rows
+    elif kind == "responses":
+        for r in await BACKING.graph.find("HarnessResponse", {"status": "deleted"}):
+            add(r, "deleted_at", "created_at")
+        due = [(at, own, r) for at, own, r in rows if not at or now - at >= _RETAIN_MS]
+    elif kind == "harnesses":
+        # A harness deleted before delete times were kept counts from its last activity: the later
+        # of its last edit and the last task it ran, which the delete came after (Richard,
+        # 2026-10-08, "Last activity"). Its last edit alone can be months before a delete made
+        # yesterday by someone who had kept using it.
+        last_task: dict[str, int] = {}
+        for sv in await BACKING.graph.find("HarnessSession"):
+            h = str(sv.get("harness_id") or "")
+            if h:
+                t = max(_stamp_ms(sv.get("updated_at")), _stamp_ms(sv.get("created_at")))
+                last_task[h] = max(last_task.get(h, 0), t)
+        for r in await BACKING.graph.find("Harness", {"deleted": "1"}):
+            if not _stamp_ms(r.get("deleted_at")):
+                r = {**r, "_last_activity": str(max(_stamp_ms(r.get("updated_at")), _stamp_ms(r.get("created_at")),
+                                                    last_task.get(str(r.get("id") or ""), 0)) or "")}
+            add(r, "deleted_at", "_last_activity")
+        due = [(at, own, r) for at, own, r in rows if not at or now - at >= _RETAIN_MS]
+    elif kind == "environments":
+        for r in await BACKING.graph.find("Environment", {"deleted": "1"}):
+            add(r, "deleted_at", "updated_at", "created_at")
+        due = [(at, own, r) for at, own, r in rows if not at or now - at >= _RETAIN_MS]
+    elif kind == "uploads":
+        for it in await _blob_list_all("uploads/", kb=RESP_BLOB_KB):
+            key = str(it.get("file_id") or "")
+            if not key.endswith(".meta"):
+                continue
+            fid = key[len("uploads/"):-len(".meta")]
+            meta = await _upload_meta(fid)
+            if meta and meta.get("deleted_at"):
+                add({"id": fid, **meta}, "deleted_at")
+        due = [(at, own, r) for at, own, r in rows if now - at >= _RETAIN_MS]
+    else:
+        return [], 0
+    due.sort(key=lambda t: t[0])
+    return [{"id": str(r.get("id") or ""), "row": r} for _, _, r in due if r.get("id")], \
+        sum(1 for _, own, _ in due if not own)
+
+
+def _harness_blobs(v: dict) -> set[str]:
+    """The skill bundles and plugin packages a harness record names."""
+    try:
+        skills = json.loads(v.get("skills") or "[]")
+    except Exception:  # noqa: BLE001
+        skills = []
+    org = str(v.get("org") or "")
+    keys = {f"skills/{sk['blob']}.json" for sk in (skills if isinstance(skills, list) else [])
+            if isinstance(sk, dict) and sk.get("blob")}
+    return keys | {_plugin_blob_key(org, str(pe["blob"])) for pe in _plugins_of(v) if pe.get("blob")}
+
+
+async def _harness_blob_refs() -> "collections.Counter[str]":
+    """How many harness records name each bundle. A client may write a bundle's id onto another
+    harness, so a removed harness's bundle goes only when no record left names it."""
+    refs: "collections.Counter[str]" = collections.Counter()
+    for h in await BACKING.graph.find("Harness"):
+        refs.update(_harness_blobs(h))
+    return refs
+
+
+async def _retention_remove(kind: str, item: dict, ctx: dict) -> str | None:
+    """Remove one due item for good. Answers why it was left, or None when it is gone."""
+    iid, row = item["id"], item["row"]
+    if kind == "sessions":
+        if "by_session" not in ctx:
+            ctx["by_session"] = await _session_index()
+        await _session_purge(iid, row, ctx["by_session"])
+        await BACKING.graph.delete(iid, "HarnessSession")
+    elif kind == "api_keys":
+        await BACKING.graph.delete(iid, "HarnessApiKey")
+    elif kind == "credentials":
+        if iid.startswith("secret:"):
+            await BACKING.secrets.delete(row["tenant"], row["name"])
+        else:
+            await BACKING.graph.delete(iid, _CONNECTION_LABEL)
+    elif kind == "responses":
+        _resp_cache_forget(iid)
+        await _blob_delete(f"responses/{iid}.json", kb=RESP_BLOB_KB)
+        await BACKING.graph.delete(iid, "HarnessResponse")
+    elif kind == "harnesses":
+        org = str(row.get("org") or "")
+        # credentials were removed at the delete; again here for a harness deleted before that
+        await _hosted_scrub_removed(org, iid, _mcp_list(row), [])
+        for c in await BACKING.graph.find(_CONNECTION_LABEL, {"harness": iid}):
+            if c.get("id"):
+                await BACKING.graph.delete(str(c["id"]), _CONNECTION_LABEL)
+        if "blob_refs" not in ctx:
+            ctx["blob_refs"] = await _harness_blob_refs()
+        refs = ctx["blob_refs"]
+        await BACKING.graph.delete(iid, "Harness")
+        for key in sorted(_harness_blobs(row)):
+            refs[key] -= 1
+            if refs[key] <= 0:
+                await _blob_delete(key, kb=BLOB_KB)
+    elif kind == "environments":
+        try:
+            r = await _env_runner("DELETE", f"/environments/{iid}", iid)
+        except HTTPException:
+            return "the runner that holds environments did not answer"
+        if r.status_code >= 400:
+            return f"the runner could not remove its files (HTTP {r.status_code})"
+        await BACKING.graph.delete(iid, "Environment")
+    elif kind == "uploads":
+        await _blob_delete(f"uploads/{iid}", kb=RESP_BLOB_KB)
+        await _blob_delete(f"uploads/{iid}.meta", kb=RESP_BLOB_KB)
+    return None
+
+
+async def _retention_sweep(dry_run: bool, kinds: list[str] | None = None, limit: int | None = None) -> dict:
+    now = _now_ms()
+    out: dict = {"dry_run": dry_run, ("would_remove" if dry_run else "removed"): {},
+                 "no_delete_time": {}, "left": {}}
+    listed = out["would_remove" if dry_run else "removed"]
+    done = True
+    ctx: dict = {}
+    for kind in kinds or _RETENTION_KINDS:
+        due, no_time = await _retention_due(kind, now)
+        batch = due[:limit] if limit else due
+        if len(batch) < len(due):
+            done = False
+        listed[kind] = []
+        if no_time:
+            out["no_delete_time"][kind] = no_time
+        for item in batch:
+            if dry_run:
+                listed[kind].append(item["id"])
+                continue
+            try:
+                why = await _retention_remove(kind, item, ctx)
+            except Exception as e:  # noqa: BLE001 — one item must not stop the sweep
+                why = f"{type(e).__name__}"
+            if why:
+                out["left"].setdefault(kind, why)
+                done = False
+            else:
+                listed[kind].append(item["id"])
+    # Nothing due is left: after a sweep, nothing it could not remove; after a dry run, nothing
+    # to list (a dry run removes nothing, so anything it lists is still due).
+    out["done"] = done and not (dry_run and any(listed.values()))
+    return out
+
+
+class RetentionSweepBody(BaseModel):
+    dry_run: bool = False
+    kinds: list[str] | None = None
+    limit: int | None = Field(default=None, ge=1)
+
+
+@app.post("/internal/retention/sweep", dependencies=[Depends(_internal_only)])
+async def retention_sweep(body: RetentionSweepBody) -> dict:
+    """Remove what has come due now, or (`dry_run`) list it. `limit` caps each kind per call, and
+    `done` says nothing due is left, so a capped run is called again until it is."""
+    kinds = [k for k in (body.kinds or []) if k not in ("arenas", "accounts")]
+    bad = [k for k in kinds if k not in _RETENTION_KINDS]
+    if bad:
+        raise uhp_error(400, "invalid_input", f"No retention kind {bad[0]!r} on this server.", "kinds",
+                        {"supported": list(_RETENTION_KINDS)})
+    return await _retention_sweep(body.dry_run, kinds or None, body.limit)
+
+
+class RetentionRestoreBody(BaseModel):
+    kind: str
+    id: str
+
+
+@app.post("/internal/retention/restore", dependencies=[Depends(_internal_only)])
+async def retention_restore(body: RetentionRestoreBody) -> dict:
+    """Bring back one item deleted within its 30 days. A kind removed at once cannot come back
+    (409); an item the sweep removed, or never was, is gone (410)."""
+    kind, iid = body.kind, body.id
+    if kind in _FOR_GOOD:
+        raise uhp_error(409, "not_restorable", f"A deleted {kind[:-1].replace('_', ' ')} is removed at once and cannot be restored.", "kind")
+    gone = uhp_error(410, "gone", "Nothing deleted with that id is kept.", "id")
+    if kind == "responses":
+        raw = await _blob_get(f"responses/{iid}.json", kb=RESP_BLOB_KB) if re.fullmatch(r"[A-Za-z0-9_-]+", iid) else None
+        try:
+            rec = json.loads(raw) if raw else None
+        except ValueError:
+            rec = None
+        if not isinstance(rec, dict) or not rec.get("_deleted"):
+            raise gone
+        rec.pop("_deleted", None)
+        rec.pop("_deleted_at", None)
+        _resp_cache_forget(iid)
+        await _blob_put(f"responses/{iid}.json", json.dumps(rec, default=str).encode(), kb=RESP_BLOB_KB)
+        await _vg_upsert("HarnessResponse", iid, {"status": str(rec.get("status") or "completed"), "deleted_at": ""})
+    elif kind in ("harnesses", "environments"):
+        label = "Harness" if kind == "harnesses" else "Environment"
+        v = await BACKING.graph.get(iid, label=label)
+        if not v or not _true(v.get("deleted")):
+            raise gone
+        if label == "Environment" and any(
+                str(r.get("id")) != iid and not _true(r.get("deleted"))
+                for r in await BACKING.graph.find("Environment", {"slug": str(v.get("slug") or "")})):
+            raise uhp_error(409, "environment_exists",
+                            f"Another environment is mounted at /env/{v.get('slug')} now; rename it first.", "id")
+        await _vg_upsert(label, iid, {"deleted": "0", "deleted_at": "", "updated_at": str(_now_ms())})
+    elif kind == "uploads":
+        meta = await _upload_meta(iid)
+        if not meta or not meta.get("deleted_at") or await _blob_get(f"uploads/{iid}", kb=RESP_BLOB_KB) is None:
+            raise gone
+        meta.pop("deleted_at", None)
+        await _blob_put(f"uploads/{iid}.meta", json.dumps(meta).encode(), kb=RESP_BLOB_KB)
+    else:
+        raise uhp_error(400, "invalid_input", f"No retention kind {kind!r} on this server.", "kind",
+                        {"supported": list(_RETENTION_KINDS)})
+    return {"kind": kind, "id": iid, "restored": True}
+
+
+@app.on_event("startup")
+async def _start_retention_sweep() -> None:
+    async def loop() -> None:
+        await asyncio.sleep(30)          # after startup's own work, not in its way
+        while True:
+            try:
+                run_it = True
+                if control_store.enabled():
+                    with contextlib.suppress(Exception):
+                        run_it = await control_store.try_lock("retention-sweep", max(60, _RETENTION_SWEEP_S - 60))
+                if run_it:
+                    res = await _retention_sweep(False)
+                    n = {k: len(v) for k, v in res["removed"].items() if v}
+                    if n or res["left"]:
+                        print(f"[retention] removed {n or 'nothing'}"
+                              + (f"; deleted before delete times were kept: {res['no_delete_time']}" if res["no_delete_time"] else "")
+                              + (f"; left: {res['left']}" if res["left"] else ""), flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[retention] sweep failed: {type(e).__name__}", flush=True)
+            await asyncio.sleep(_RETENTION_SWEEP_S)
+    asyncio.create_task(loop())
+
+
 @app.get("/internal/storage-usage", dependencies=[Depends(_internal_only)])
 async def storage_usage() -> dict:
     """Total durable workspace bytes per org, for the daily storage.gb_day billing sweep.
@@ -9277,13 +9660,17 @@ async def delete_response(response_id: str, request: Request):
     # 403) so a cross-org id probe can't confirm existence. Legacy records with no _org stay owned.
     if str(rec.get("_org") or principal.get("org", "")) != principal.get("org", "") or not await _response_in_reach(principal, rec):
         raise uhp_error(404, "response_not_found", "No response with that id.", "response_id")
+    # Kept 30 days, restorable, then removed by the retention sweep (Richard's rule, 2026-10-08).
+    # Unreadable from now: `_resp_get` answers None for a record marked deleted.
+    now = _now_ms()
     rec["_deleted"] = True
+    rec["_deleted_at"] = now
     try:
         _resp_cache_forget(response_id)
         await _blob_put(f"responses/{response_id}.json", json.dumps(rec, default=str).encode(), kb=RESP_BLOB_KB)
     except Exception:  # noqa: BLE001
         pass
-    await _vg_upsert("HarnessResponse", response_id, {"status": "deleted"})
+    await _vg_upsert("HarnessResponse", response_id, {"status": "deleted", "deleted_at": str(now)})
 
 
 # ── Session sharing + artifact serving by path (HRP-011) ─────────────────────────────────
@@ -9682,6 +10069,40 @@ async def upload_file(request: Request, purpose: str = Form("user_data"), file: 
             "filename": file.filename, "purpose": purpose}
 
 
+_UPLOAD_ID = re.compile(r"file_[0-9a-f]{32}")
+
+
+async def _upload_meta(fid: str) -> dict | None:
+    """An upload's sidecar, or None when there is no such upload. An upload from before sidecars
+    existed answers an empty one."""
+    if not _UPLOAD_ID.fullmatch(fid or ""):
+        return None
+    raw = await _blob_get(f"uploads/{fid}.meta", kb=RESP_BLOB_KB)
+    if raw is None:
+        return {} if await _blob_get(f"uploads/{fid}", kb=RESP_BLOB_KB) is not None else None
+    try:
+        meta = json.loads(raw.decode())
+    except Exception:  # noqa: BLE001
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str, request: Request) -> dict:
+    """Delete an upload. Kept 30 days, restorable, then removed by the retention sweep (Richard's
+    rule, 2026-10-08); from now on a task that names it is refused as an unknown id is. The same
+    owner rule as a read: another organization's upload answers 404."""
+    principal = await _principal(request)
+    org = str(principal.get("org") or "")
+    meta = await _upload_meta(file_id)
+    if meta is None or meta.get("deleted_at") or (meta.get("org") and str(meta["org"]) != org):
+        raise uhp_error(404, "file_not_found", f"No file with id {file_id}.", "file_id")
+    meta["deleted_at"] = _now_ms()
+    if not await _blob_put(f"uploads/{file_id}.meta", json.dumps(meta).encode(), kb=RESP_BLOB_KB):
+        raise HTTPException(502, "the file could not be deleted; try again")
+    return {"id": file_id, "object": "file", "deleted": True}
+
+
 async def _resolve_uploads(files_in: list[dict], org: str) -> None:
     """Inline the uploads a task references by file_id, for THIS org only.
 
@@ -9702,7 +10123,8 @@ async def _resolve_uploads(files_in: list[dict], org: str) -> None:
             except Exception:  # noqa: BLE001
                 meta = {}
         owner = str(meta.get("org") or "")
-        data = None if (owner and owner != org) else await _blob_get(f"uploads/{fid}", kb=RESP_BLOB_KB)
+        gone = bool(meta.get("deleted_at"))
+        data = None if (gone or (owner and owner != org)) else await _blob_get(f"uploads/{fid}", kb=RESP_BLOB_KB)
         if data is None:
             raise uhp_error(404, "file_not_found", f"No file with id {fid}.", "input")
         f["content_b64"] = base64.b64encode(data).decode()
@@ -10448,6 +10870,12 @@ async def revoke_key(org: str, kid: str, request: Request) -> dict:
             await control_store.apikey_revoke(kid)
         except Exception:  # noqa: BLE001 — graph is authoritative; the store tombstone is a fast-path
             pass
+    # Then removed at once, with no undo (Richard's rule, 2026-10-08): the record goes, and with
+    # it the key's name and last use. Revoked first so a removal that fails still leaves it dead;
+    # the retention sweep removes what a failed removal left. A last-use stamp landing after
+    # this writes a record with no kind, which no lookup accepts and the sweep removes.
+    with contextlib.suppress(Exception):
+        await BACKING.graph.delete(kid, "HarnessApiKey")
     return {"id": kid, "revoked": True}
 
 
@@ -10563,21 +10991,128 @@ async def _internal_target(host: str, port: int) -> str | None:
     1.01 s lookup let ZERO other tasks run. Every provider file URL is classified on every poll, so
     one relay naming a slow-resolving host froze the gateway for everybody, ten seconds apart.
     """
-    loop = asyncio.get_running_loop()
+    return (await _classify_target(host, port))[1]
+
+
+def _ip_internal(addr: str) -> bool:
+    ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified
+                or any(ip in net for net in _INTERNAL_NETS if ip.version == net.version))
+
+
+async def _resolve(host: str, port: int) -> list:
+    """The one DNS lookup every check makes (a test answers it differently each time)."""
+    return await asyncio.get_running_loop().getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+
+
+async def _classify_target(host: str, port: int) -> tuple[list[str], str | None]:
+    """Resolve a name once and classify every answer: (the addresses, None) when all are outside,
+    ([], why) when any is inside or the lookup failed. The addresses are what a connection must
+    then use (`_CheckedNetwork`), so the name is never resolved a second time between the check
+    and the socket."""
     try:
-        infos = await loop.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        infos = await _resolve(host, port)
     except socket.gaierror as e:
         no_such = {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
-        return "host does not resolve" if e.errno in no_such else "host could not be resolved"
+        return [], ("host does not resolve" if e.errno in no_such else "host could not be resolved")
     except Exception:  # noqa: BLE001
-        return "host could not be resolved"
+        return [], "host could not be resolved"
+    addrs: list[str] = []
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-                or ip.is_multicast or ip.is_unspecified
-                or any(ip in net for net in _INTERNAL_NETS if ip.version == net.version)):
-            return "target resolves to a disallowed (internal) address"
-    return None
+        if _ip_internal(info[4][0]):
+            return [], "target resolves to a disallowed (internal) address"
+        if info[4][0] not in addrs:
+            addrs.append(info[4][0])
+    return addrs, None
+
+
+class _CheckedNetwork(httpcore.AsyncNetworkBackend):
+    """Opens a socket only to an address it classified itself, in the same step.
+
+    `_internal_target` answers for a name, and the client then resolved the name again when it
+    opened the socket: a name that answers a public address to the check and an internal one a
+    moment later (a DNS rebind) passed. Here the name is resolved once, every answer is classified,
+    and the socket goes to one of those very addresses. TLS still verifies the certificate against
+    the name, since httpcore takes the server name from the request, not from this socket. Redirects
+    are not followed by these clients, and if one ever were, its connection would come through here
+    as well.
+
+    `always`: classify on every deployment (a provider's file address), or only on one shared by
+    several organizations (an address a member typed: MCP servers, upload destinations), where a
+    self-hosted box's own network is not refused."""
+
+    def __init__(self, always: bool) -> None:
+        self._inner = httpcore.AnyIOBackend()
+        self._always = always
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        if not (self._always or not _pool_is_local()):
+            return await self._inner.connect_tcp(host, port, timeout=timeout, local_address=local_address,
+                                                 socket_options=socket_options)
+        addrs, why = await _classify_target(host, port)
+        if why:
+            raise httpcore.ConnectError(f"that address cannot be used: {why}")
+        last: Exception | None = None
+        for addr in addrs:
+            try:
+                return await self._inner.connect_tcp(addr, port, timeout=timeout, local_address=local_address,
+                                                     socket_options=socket_options)
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as e:
+                last = e
+        raise last or httpcore.ConnectError("no address to connect to")
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise httpcore.ConnectError("a local socket is not a network address")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+async def _sql_peer_check(addr: str) -> str | None:
+    """sql_plane.PEER_CHECK: on a shared deployment, a database connection that reached a private,
+    local or metadata address is closed before any query. A self-hosted box's own database is the
+    normal case there, as it is for the check made when the connection is saved."""
+    if _pool_is_local():
+        return None
+    if not addr:
+        return "the address it reached could not be read"
+    try:
+        return "it is on a private, local or metadata network" if _ip_internal(addr) else None
+    except ValueError:
+        return "the address it reached is not a network address"
+
+
+sql_plane.PEER_CHECK = _sql_peer_check
+
+_checked_clients: dict[bool, httpx.AsyncClient] = {}
+
+
+def _checked_http(always: bool = False) -> httpx.AsyncClient:
+    """The client for an address somebody else named. Its pool opens connections through
+    `_CheckedNetwork`; httpx 0.28 takes no network backend, so the pool it built is handed one.
+    No environment proxies (a transport given explicitly turns them off): a proxy would resolve
+    the name itself, and the check would be about the proxy."""
+    c = _checked_clients.get(always)
+    if c is None:
+        # Limits belong to the transport: httpx applies a client's own only to a transport it builds.
+        c = _checked_clients[always] = httpx.AsyncClient(
+            transport=_checked_transport(always, httpx.Limits(max_connections=200, max_keepalive_connections=40)),
+            follow_redirects=False, timeout=httpx.Timeout(connect=30, read=600, write=120, pool=60))
+    return c
+
+
+def _checked_transport(always: bool, limits: httpx.Limits | None = None) -> httpx.AsyncHTTPTransport:
+    transport = httpx.AsyncHTTPTransport(limits=limits or httpx.Limits())
+    transport._pool._network_backend = _CheckedNetwork(always)
+    return transport
+
+
+# The plugin vendors' client (plugs_plane.client) opens its connections the same way: a plug's
+# address can be one a member typed (an InsForge backend), and its answer goes back to the agent.
+# On a shared deployment that was a way into the private network; GitHub, Vercel and Microsoft are
+# public and pass the same check.
+plugs_plane.checked_transport = lambda: _checked_transport(False)
 
 
 async def _mcp_list_tools(url: str, token: str) -> dict:
@@ -10590,7 +11125,7 @@ async def _mcp_list_tools(url: str, token: str) -> dict:
     headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
     if token:
         headers["authorization"] = token if token.lower().startswith("bearer ") else f"Bearer {token}"
-    c = _client()
+    c = _checked_http()
     init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                        "clientInfo": {"name": "harnessrouter", "version": "1"}}}
@@ -10652,6 +11187,25 @@ async def put_mcp_secret(org: str, ref: str, body: McpSecretBody, request: Reque
     return await _mcp_secret_store(org, ref, body.token)
 
 
+@app.delete("/v1/orgs/{org}/mcp-secrets/{ref}")
+async def delete_mcp_secret(org: str, ref: str, request: Request) -> dict:
+    await _owned_org(request, org)
+    return await _mcp_secret_delete(org, ref)
+
+
+async def _mcp_secret_delete(org: str, ref: str) -> dict:
+    """Remove a stored MCP server token, at once and for good: a credential is not kept after its
+    delete (Richard's rule, 2026-10-08), and before this the only way to be rid of one was to
+    overwrite it. A harness that still names the reference runs without it."""
+    tenant = _org_tenant(org)
+    if not tenant:
+        raise HTTPException(400, "no org to remove the secret for")
+    safe = re.sub(r"[^a-z0-9]+", "-", ref.lower()).strip("-") or "mcp"
+    key = f"{_MCP_SECRET_PREFIX}{safe}"
+    await BACKING.secrets.delete(tenant, key)
+    return {"ref": f"vault:{key}", "deleted": True}
+
+
 @app.post("/v1/orgs/{org}/mcp-test")
 async def test_mcp(org: str, body: McpTestBody, request: Request) -> dict:
     await _owned_org(request, org)
@@ -10670,6 +11224,12 @@ async def test_mcp(org: str, body: McpTestBody, request: Request) -> dict:
 async def put_mcp_secret_public(ref: str, body: McpSecretBody, request: Request) -> dict:
     org, _ = await _pub_org_member(request)
     return await _mcp_secret_store(org, ref, body.token)
+
+
+@app.delete("/v1/mcp-secrets/{ref}")
+async def delete_mcp_secret_public(ref: str, request: Request) -> dict:
+    org, _ = await _pub_org_member(request)
+    return await _mcp_secret_delete(org, ref)
 
 
 @app.post("/v1/mcp-test")
@@ -10828,19 +11388,22 @@ def _hosted_keys(servers: list[dict]) -> set[str]:
 
 
 async def _hosted_scrub_removed(org: str, hid: str, before: list[dict], after: list[dict]) -> None:
-    """Overwrite the record behind every hosted entry this write removed.
+    """Remove the record behind every hosted entry this write removed.
 
     Dropping the entry and leaving its connection string encrypted on disk would be a surprise of
     the worst kind: removing the tool, or deleting the agent, is the most decisive thing the
     surface offers. Shared by every write that can drop an entry, so they cannot promise
-    differently.
+    differently. Removed rather than overwritten: a credential goes at once and for good, even
+    when its harness is deleted and later restored (Richard's rule, 2026-10-08), and an empty
+    overwrite needed an encryption key the store may not have, so on such an instance the
+    connection string stayed exactly as it was.
 
     THE RECORD MUST BE THIS HARNESS'S — the same binding _hosted_resolve refuses a read on. `auth`
     is a client-writable field and harness ids are public, so anyone may name another agent's ref
     on an entry of their own; removing it would otherwise destroy a connection they were never
     given. Losing a database is the louder of the two surprises, so the check belongs on both.
     Positive evidence of foreign ownership is what skips the scrub: a record we cannot read is one
-    we overwrite, because leaving a connection string behind is the failure this function exists
+    we remove, because leaving a connection string behind is the failure this function exists
     to prevent.
     """
     gone = _hosted_keys(before) - _hosted_keys(after)
@@ -10855,7 +11418,7 @@ async def _hosted_scrub_removed(org: str, hid: str, before: list[dict], after: l
                   flush=True)
             continue
         with contextlib.suppress(Exception):   # an unwritable store must not block the write
-            await BACKING.secrets.put(tenant, key, "", require_encryption=True)
+            await BACKING.secrets.delete(tenant, key)
         scrubbed += 1
     if scrubbed:
         print(f"[sql] {hid}: disconnected ({scrubbed} record(s) scrubbed)", flush=True)
@@ -11014,7 +11577,7 @@ async def _mcp_migrate(org: str, hid: str, v: dict | None) -> dict | None:
     await _vg_upsert("Harness", hid, {"mcp_servers": json.dumps(servers), _DS_PROP_LEGACY: ""})
     with contextlib.suppress(Exception):   # an unwritable store must not strand the conversion
         tenant = org if _vault_tenant_ok(org) else GLOBAL_TENANT
-        await BACKING.secrets.put(tenant, old_key, "", require_encryption=True)
+        await BACKING.secrets.delete(tenant, old_key)
     print(f"[migrate] {hid}: database is now an ordinary MCP server", flush=True)
     return {**v, "mcp_servers": json.dumps(servers), _DS_PROP_LEGACY: ""}
 
@@ -11088,12 +11651,13 @@ async def _connection_vertex_put(org: str, hid: str, v: dict | None, entry_id: s
 
 
 async def _connection_vertex_drop(hid: str, key: str) -> None:
-    """The entry is gone, so the configuration is gone with it (the record was scrubbed already)."""
+    """The entry is gone, so the configuration is gone with it (the record was removed already):
+    removed, not marked, since it describes a credential that is gone for good."""
     with contextlib.suppress(Exception):
         for row in await BACKING.graph.find(_CONNECTION_LABEL, {"harness": hid, "secret_key": key}):
             vid = str(row.get("id") or "")
             if vid:
-                await _vg_upsert(_CONNECTION_LABEL, vid, {"deleted": "1", "updated_at": str(int(time.time() * 1000))})
+                await BACKING.graph.delete(vid, _CONNECTION_LABEL)
 
 
 async def _connections_of(org: str, hid: str) -> list[dict]:
@@ -11535,6 +12099,12 @@ def _media_client() -> httpx.AsyncClient:
     """The client every provider call goes through. One seam, so a test can drive all five
     adapters through a transport it controls without stubbing the adapters themselves."""
     return _client()
+
+
+def _media_fetch_client() -> httpx.AsyncClient:
+    """The client a finished file is fetched with: the address is the provider's to name, so the
+    connection goes only to an address classified in the same step, on every deployment."""
+    return _checked_http(always=True)
 
 
 async def _media_providers() -> dict[str, dict]:
@@ -12138,7 +12708,7 @@ async def _media_fetch(url: str) -> bytes:
         raise media_plane.MediaEmpty(refused)
     buf = bytearray()
     try:
-        async with _media_client().stream("GET", url, timeout=300) as r:
+        async with _media_fetch_client().stream("GET", url, timeout=300) as r:
             if r.status_code >= 400:
                 raise media_plane.MediaEmpty(f"the finished file could not be fetched "
                                              f"(HTTP {r.status_code})")
@@ -14217,8 +14787,10 @@ async def _media_harness_purge(hid: str) -> None:
 
 
 async def _media_session_purge(sid: str) -> None:
-    """Deleting the video deletes its media and tombstones its jobs. Called from the one place
-    that deletes a session, so there is no second answer to 'is it gone'."""
+    """Deleting the video deletes its media and its jobs. Called from the one place that deletes
+    a session, so there is no second answer to 'is it gone'. A job still running is first marked
+    deleted, which is what stops the sweeper; then every job's record is removed, finished ones
+    included, because a job's record is the session's (Richard's rule, 2026-10-08)."""
     with contextlib.suppress(Exception):
         for it in await _blob_list_all(f"media/{sid}/", kb=BLOB_KB):
             await _blob_delete(str(it.get("file_id") or ""), kb=BLOB_KB)
@@ -14227,6 +14799,10 @@ async def _media_session_purge(sid: str) -> None:
     with contextlib.suppress(Exception):
         for job in await _media_jobs_of(sid):
             await _vg_upsert(_MEDIA_JOB_LABEL, job["id"], {"deleted": "1", "status": "deleted"})
+    with contextlib.suppress(Exception):
+        for row in await BACKING.graph.find(_MEDIA_JOB_LABEL, {"session": sid}):
+            if row.get("id"):
+                await BACKING.graph.delete(str(row["id"]), _MEDIA_JOB_LABEL)
 
 
 # ── plugs: services connected once for a workspace, reached through one hosted server ─────────
@@ -16727,10 +17303,14 @@ async def delete_environment(env_id: str, request: Request) -> dict:
     v = await _environment_refresh(v)
     if str(v.get("status") or "") == "building":
         raise uhp_error(409, "environment_busy", "A build is running; wait for it before deleting.")
-    r = await _env_runner("DELETE", f"/environments/{env_id}", env_id, params={"slug": str(v.get("slug") or "")})
+    # Kept 30 days, restorable, then removed with its files by the retention sweep (Richard's
+    # rule, 2026-10-08). What goes now is its place at /env/<slug>: no session sees it from here,
+    # and the name is free for another environment.
+    r = await _env_runner("DELETE", f"/environments/{env_id}/mount", env_id, params={"slug": str(v.get("slug") or "")})
     if r.status_code >= 500:
-        raise _env_runner_error(r, "the environment's files could not be removed")
-    await _vg_upsert("Environment", env_id, {"deleted": "1", "updated_at": str(int(time.time() * 1000))})
+        raise _env_runner_error(r, "the environment could not be taken down")
+    now = str(_now_ms())
+    await _vg_upsert("Environment", env_id, {"deleted": "1", "deleted_at": now, "updated_at": now})
     return {"id": env_id, "deleted": True}
 
 
@@ -16803,13 +17383,15 @@ class EnvironmentImportBody(BaseModel):
     replace: bool = False
 
 
-async def _git_url_refused(url: str) -> str | None:
-    """Why this server will not clone from that address, or None: the rule an MCP address follows
-    (_ssrf_check). A self-hosted box's private network is its operator's own and is allowed; on a
-    shared deployment an address that resolves to a private, local or metadata range is refused,
-    since the clone runs on this side (reported privately, GHSA-mw9j-m5jf-5r56)."""
+async def _git_url_refused(url: str) -> tuple[str | None, str]:
+    """Why this server will not clone from that address (or None), and the address the clone must
+    connect to: the rule an MCP address follows (_ssrf_check). A self-hosted box's private network
+    is its operator's own and is allowed, with no pin; on a shared deployment an address that
+    resolves to a private, local or metadata range is refused, since the clone runs on this side
+    (reported privately, GHSA-mw9j-m5jf-5r56), and the clone is pinned to an address classified
+    here as "<host>:<port>:<address>", so the name is not resolved again when git connects."""
     if _pool_is_local():
-        return None
+        return None, ""
     from urllib.parse import urlparse
     u = str(url or "")
     if u.startswith("git@"):
@@ -16819,10 +17401,11 @@ async def _git_url_refused(url: str) -> str | None:
             p = urlparse(u)
             host, port = p.hostname or "", p.port or {"http": 80, "ssh": 22}.get(p.scheme, 443)
         except ValueError:
-            return "invalid url"
+            return "invalid url", ""
     if not host:
-        return "url has no host"
-    return await _internal_target(host, port)
+        return "url has no host", ""
+    addrs, why = await _classify_target(host, port)
+    return (why, "") if why else (None, f"{host}:{port}:{addrs[0]}")
 
 
 @app.post("/v1/environments/{env_id}/import")
@@ -16836,12 +17419,12 @@ async def environment_import(env_id: str, request: Request, replace: int = 0) ->
         git = body.git or {}
         if not str(git.get("url") or ""):
             raise uhp_error(422, "environment_invalid", "Name a git url, or send an archive as the body.", "git.url")
-        refused = await _git_url_refused(str(git.get("url")))
+        refused, pin = await _git_url_refused(str(git.get("url")))
         if refused:
             raise uhp_error(422, "environment_invalid", f"That git address cannot be used: {refused}.", "git.url")
         r = await _env_runner("POST", f"/environments/{env_id}/import", env_id, timeout=900.0,
                               params={"replace": int(bool(replace or body.replace)), "git_url": str(git.get("url")),
-                                      "git_ref": str(git.get("ref") or "")}, content=b"")
+                                      "git_ref": str(git.get("ref") or ""), "git_pin": pin}, content=b"")
     else:
         declared = int(request.headers.get("content-length") or 0)
         if declared > _ENV_IMPORT_MAX:
@@ -17579,14 +18162,21 @@ async def delete_harness(org: str, hid: str, request: Request) -> dict:
     _caller = await _owned_org(request, org)
     # V1C02-005: only delete a harness that belongs to the caller's org.
     cur = await _harness_in_reach(_caller, hid, deleted_ok=True)
-    cur = await _mcp_migrate(org, hid, cur)
-    await _vg_upsert("Harness", hid, {"deleted": "1"})
-    # a deleted agent must not still be holding a database password, and must not still be
-    # spending at a provider
-    await _hosted_scrub_removed(org, hid, _mcp_list(cur), [])
-    await _media_harness_purge(hid)
-    await _plugins_discard(org, cur)
+    await _harness_delete(org, hid, cur)
     return {"id": hid, "deleted": True}
+
+
+async def _harness_delete(org: str, hid: str, v: dict) -> None:
+    """The one delete both routes call. The harness is kept 30 days, restorable, and then removed
+    with its plugin packages by the retention sweep (Richard's rule, 2026-10-08); the sessions and
+    responses that used it are not touched (Harnesses §5.3). What cannot wait goes now: a deleted
+    agent must not still be holding a database password, and must not still be spending at a
+    provider. A second delete keeps the first one's time, so it cannot extend the 30 days."""
+    v = await _mcp_migrate(org, hid, v)
+    if str(v.get("deleted")) not in ("1", "true", "True") or not v.get("deleted_at"):
+        await _vg_upsert("Harness", hid, {"deleted": "1", "deleted_at": str(_now_ms())})
+    await _hosted_scrub_removed(org, hid, _mcp_list(v), [])
+    await _media_harness_purge(hid)
 
 
 # ── workspaces: the DIRECTORY, server-side (fix for the localStorage split-brain) ──────
@@ -18171,8 +18761,8 @@ async def _cloud_me(base_url: str, api_key: str) -> dict:
     if refused:
         raise HTTPException(400, f"that address cannot be used: {refused}")
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as c:
-            r = await c.get(f"{base_url}/v1/me", headers={"authorization": f"Bearer {api_key}"})
+        r = await _checked_http().get(f"{base_url}/v1/me", headers={"authorization": f"Bearer {api_key}"},
+                                      timeout=httpx.Timeout(20.0, connect=8.0))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"could not reach {base_url}: {str(e)[:120]}")
     if r.status_code == 401:
@@ -18261,9 +18851,9 @@ async def _cloud_upload_one(org: str, hid: str, target: dict, records: dict) -> 
         return {"id": hid, "ok": False, "action": "skip", "error": f"that address cannot be used: {refused}"}
     plugins_ok = False
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as c:
-            d = (await c.get(f"{target['base_url']}/v1/uhp")).json()
-            plugins_ok = bool((d.get("capabilities") or {}).get("plugins"))
+        d = (await _checked_http().get(f"{target['base_url']}/v1/uhp",
+                                       timeout=httpx.Timeout(10.0, connect=5.0))).json()
+        plugins_ok = bool((d.get("capabilities") or {}).get("plugins"))
     except Exception:  # noqa: BLE001
         plugins_ok = False
     body = await _cloud_harness_body(org, hid, v, plugins_ok)
@@ -18291,9 +18881,9 @@ async def _cloud_upload_one(org: str, hid: str, target: dict, records: dict) -> 
     last_error = ""
     for attempt in (remote_id, "chrn" + uuid.uuid4().hex):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=8.0)) as c:
-                r = await c.put(f"{target['base_url']}/v1/harnesses/{attempt}", json=body,
-                                headers={"authorization": f"Bearer {target['api_key']}"})
+            r = await _checked_http().put(f"{target['base_url']}/v1/harnesses/{attempt}", json=body,
+                                          headers={"authorization": f"Bearer {target['api_key']}"},
+                                          timeout=httpx.Timeout(60.0, connect=8.0))
         except Exception as e:  # noqa: BLE001
             return {"id": hid, "ok": False, "action": action, "error": f"could not reach cloud: {str(e)[:120]}"}
         if r.status_code in (200, 201):
@@ -18734,11 +19324,5 @@ async def delete_harness_public(hid: str, request: Request) -> dict:
     _caller = await _pub_principal(request)
     org = _caller["org"]
     v = await _harness_in_reach(_caller, hid, deleted_ok=True)
-    v = await _mcp_migrate(org, hid, v)
-    await _vg_upsert("Harness", hid, {"deleted": "1"})
-    # a deleted agent must not still be holding a database password, and must not still be
-    # spending at a provider
-    await _hosted_scrub_removed(org, hid, _mcp_list(v), [])
-    await _media_harness_purge(hid)
-    await _plugins_discard(org, v)
+    await _harness_delete(org, hid, v)
     return {"id": hid, "deleted": True}
