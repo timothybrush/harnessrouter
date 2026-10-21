@@ -84,6 +84,7 @@ from pydantic import BaseModel
 
 import environments   # the read-only project layer a turn may name (runner/environments.py)
 import reasoning      # how much a model thinks on a turn: levels and what sets them (runner/reasoning.py)
+import tracecontext   # the caller's W3C trace context: its checks and a child for the relay (#473)
 
 app = FastAPI(title="harness-runner")
 
@@ -179,6 +180,15 @@ def _reap_workspaces(keep: str = "") -> int:
             removed += 1
         except OSError:
             continue
+    # A marker whose folder went some other way (by hand, while the runner was down): markers live
+    # on the volume now, so nothing else would ever remove it.
+    try:
+        for m in os.scandir(_WS_MARKER_DIR):
+            name = m.name.removesuffix(".sha")
+            if m.name.endswith(".sha") and name != keep and not os.path.isdir(os.path.join(WORKSPACE_ROOT, name)):
+                _ws_marker_clear(name)
+    except OSError:
+        pass
     if removed:
         print(f"[reap] removed {removed} workspace(s) idle > {WS_TTL_HOURS}h", flush=True)
     return removed
@@ -3884,6 +3894,23 @@ _HERMES_RELAY: dict = {"server": None, "port": 0, "routes": {}, "lock": threadin
 _TURN_THINKING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("hr_turn_thinking", default=None)
 
 
+# The caller's W3C trace context (#473), for the turn being built: {"traceparent": ..., "tracestate":
+# ...}. The relay's routes are registered on the thread that runs /turn, so a context variable is
+# what carries the context from the request to the routes — the relay serves each call on a thread
+# of its own, where a context variable would not be visible.
+_TURN_TRACE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("hr_turn_trace", default=None)
+
+
+def _route_trace_flag() -> dict:
+    """The turn's trace context, as a route flag. Every route of the turn carries it, so the relay
+    gives the provider request a child of the caller's span whichever way the route was made."""
+    trace = _TURN_TRACE.get() or {}
+    if not trace.get("traceparent"):
+        return {}
+    return {"traceparent": trace["traceparent"],
+            **({"tracestate": trace["tracestate"]} if trace.get("tracestate") else {})}
+
+
 def _turn_route(flags: dict) -> dict:
     """A route's flags, remembered as one of the routes of the turn being built."""
     t = _TURN_THINKING.get()
@@ -5251,10 +5278,35 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
             return
         tail = self.path.removeprefix("/v1") if self.path.startswith("/v1/") else self.path
         drop = {"host", "content-length", "authorization", "x-goog-api-key", "x-api-key", "connection",
-                "accept-encoding", "transfer-encoding"}
+                "accept-encoding", "transfer-encoding", "baggage"}
         headers = {k: v for k, v in self.headers.items() if k.lower() not in drop}
         headers["authorization"] = f"Bearer {key}"
         headers.setdefault("accept", "*/*")
+        # The turn's trace context, as a child of it: the same trace id, a new span id (this hop is
+        # a span of its own), the sampled flag kept. The client's own header is replaced, not left
+        # beside it — two traceparents would leave the provider unable to say which span is which.
+        # A turn with no trace context sends none of its own, and the client's headers go upstream
+        # exactly as they did before: the relay changes nothing it was not asked to change.
+        #
+        # The turn's context is the trace's root here: the caller's trace id is never taken from
+        # the client. A CLI that read TRACEPARENT from its environment has already made a child of
+        # the caller's span, and the provider's request belongs under THAT span — so the CLI's own
+        # header is the parent when it carries the caller's trace id, and is ignored otherwise.
+        parent = str(flags.get("traceparent") or "")
+        inbound = next((v for k, v in headers.items() if k.lower() == "traceparent"), "")
+        if parent:
+            if tracecontext.trace_id(inbound) and tracecontext.trace_id(inbound) == tracecontext.trace_id(parent):
+                parent = inbound
+            child = tracecontext.child(parent)
+            if child:
+                for _k in [k for k in headers if k.lower() == "traceparent"]:
+                    del headers[_k]
+                headers["traceparent"] = child
+                state = str(flags.get("tracestate") or "")
+                for _k in [k for k in headers if k.lower() == "tracestate"]:
+                    del headers[_k]
+                if state:
+                    headers["tracestate"] = state
         if flags.get("passthrough"):
             self._passthrough(base, key, tail, headers, body)
             return
@@ -5967,7 +6019,8 @@ def _qoder_relay_route(base_url: str, api_key: str) -> tuple[str, str]:
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             _HERMES_RELAY["server"], _HERMES_RELAY["port"] = srv, srv.server_address[1]
         tok = "hr-relay-" + uuid.uuid4().hex
-        _HERMES_RELAY["routes"][tok] = ((base_url or "").rstrip("/"), api_key, _turn_route({"passthrough": True}))
+        _HERMES_RELAY["routes"][tok] = ((base_url or "").rstrip("/"), api_key,
+                                        _turn_route({"passthrough": True, **_route_trace_flag()}))
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
 
@@ -5979,7 +6032,8 @@ def _bedrock_anthropic_route(origin: str, api_key: str) -> tuple[str, str]:
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             _HERMES_RELAY["server"], _HERMES_RELAY["port"] = srv, srv.server_address[1]
         tok = "hr-relay-" + uuid.uuid4().hex
-        _HERMES_RELAY["routes"][tok] = (origin, api_key, {"bedrock_anthropic": True})
+        _HERMES_RELAY["routes"][tok] = (origin, api_key,
+                                        {"bedrock_anthropic": True, **_route_trace_flag()})
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
 
@@ -6120,7 +6174,8 @@ def _gemini_relay_route(host_root: str, api_key: str, model: str = "", native_mo
         tok = "hr-relay-" + uuid.uuid4().hex
         _HERMES_RELAY["routes"][tok] = (host_root.rstrip("/"), api_key,
                                         _turn_route({"google_native": True, "model": model,
-                                                     "native_model": native_model, **_turn_effort()}))
+                                                     "native_model": native_model, **_turn_effort(),
+                                                     **_route_trace_flag()}))
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
 
@@ -6159,6 +6214,9 @@ def _hermes_relay_route(base_url: str, api_key: str, drop_fields: tuple[str, ...
                  "stream_usage": bool(stream_usage), "gemini_schemas": bool(gemini_schemas),
                  "usage_no_nulls": bool(usage_no_nulls), "plain_stream": bool(plain_stream),
                  **({"aux": True} if aux else _turn_effort())}
+        # The turn's trace context (#473), on every route of this turn: the relay reads it when it
+        # forwards, and the relay's own threads never see the turn's context variables.
+        flags.update(_route_trace_flag())
         _HERMES_RELAY["routes"][tok] = (upstream, api_key, flags if aux else _turn_route(flags))
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
@@ -9327,7 +9385,7 @@ def _systemone_relay_route(provider: str, base_url: str, api_key: str) -> tuple[
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             _HERMES_RELAY["server"], _HERMES_RELAY["port"] = srv, srv.server_address[1]
         tok = "hr-relay-" + uuid.uuid4().hex
-        _HERMES_RELAY["routes"][tok] = (base, api_key, {})
+        _HERMES_RELAY["routes"][tok] = (base, api_key, dict(_route_trace_flag()))
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
 
@@ -12603,7 +12661,30 @@ def backends() -> dict:
 # sha256 of the checkpoint each session's workspace currently holds. PER SESSION, and outside
 # the workspace so it survives the wipe: one shared marker meant a second session's hydrate
 # answered the first session's "do you already have this checkpoint?" probe.
-_WS_MARKER_DIR = "/tmp/hr-ws"
+#
+# It has to live as long as the workspace does. Self-hosted keeps workspaces on the /data volume
+# so a restart doesn't discard work in flight, but the markers sat in /tmp, which a restart empties:
+# the next probe missed, the gateway restored the last end-of-turn checkpoint over the surviving
+# folder, and everything the interrupted turn had written was deleted, files and conversation
+# (#505). The entrypoint names the place on the volume (HR_WS_MARKER_DIR). Without it, a runner
+# that holds several sessions puts them beside its workspace root, as environments.py does with its
+# own root, so a runner started some other way keeps them as long as its workspaces too; a
+# per-session sandbox, or a runner that cannot write there, keeps /tmp.
+def _ws_marker_dir() -> str:
+    named = os.environ.get("HR_WS_MARKER_DIR")
+    if named:
+        return named
+    if _SANDBOX_PER_SESSION:
+        return "/tmp/hr-ws"
+    beside = os.path.join(os.path.dirname(WORKSPACE_ROOT.rstrip("/")) or "/", "ws-markers")
+    try:
+        os.makedirs(beside, mode=0o700, exist_ok=True)
+    except OSError:
+        return "/tmp/hr-ws"
+    return beside if os.access(beside, os.W_OK) else "/tmp/hr-ws"
+
+
+_WS_MARKER_DIR = _ws_marker_dir()
 
 
 def _ws_marker_path(identifier: str) -> pathlib.Path:
@@ -12703,6 +12784,9 @@ async def hydrate(request: Request, identifier: str = "") -> dict:
         # Warm-pool sandboxes are REUSED across sessions, so /workspace may hold a PRIOR session's
         # files (incl. another tenant's). Wipe it before restoring so this session starts from
         # exactly its own checkpoint (or empty) — multi-tenant isolation, not best-effort.
+        # The marker goes first: a restart in the middle of the wipe or the untar must not leave it
+        # vouching for a half-restored folder, now that it outlives a restart.
+        _ws_marker_clear(identifier)
         for child in ws_path.iterdir():
             try:
                 if child.is_dir() and not child.is_symlink():
@@ -13281,6 +13365,8 @@ class TurnReq(BaseModel):
     reasoning_effort: str | None = None    # how much the model thinks this turn: one of reasoning.LEVELS; unset = the model's default
     reasoning_route: str | None = None     # which measured provider the connection is (reasoning.ROUTES), from the gateway,
                                            # which knows it when the base here is a broker's; unset = read it off the base
+    traceparent: str | None = None          # the caller's W3C trace context (#473); unset = the turn has none
+    tracestate: str | None = None           # its vendor state for that trace; never `baggage`
 
 
 @app.post("/turn")
@@ -13380,6 +13466,15 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
     turn_thinking = {"asked": effort if effort in reasoning.LEVELS else "", "applied": "", "routes": [],
                      "route": named if named in reasoning.ROUTES else ""}
     _TURN_THINKING.set(turn_thinking)
+    # The caller's W3C trace context (#473). The CLI's environment carries it, so a tool in the turn
+    # that speaks OpenTelemetry joins the caller's trace; the relay gives the model calls a child of
+    # it. Nothing is set when the turn carried no context.
+    turn_trace = tracecontext.parse(req.traceparent, req.tracestate)
+    _TURN_TRACE.set(turn_trace)
+    if turn_trace.get("traceparent"):
+        env["TRACEPARENT"] = turn_trace["traceparent"]
+    if turn_trace.get("tracestate"):
+        env["TRACESTATE"] = turn_trace["tracestate"]
     # Image generation. Deliberately NOT the OPENAI_* names: on a codex harness those already
     # point at the CHAT connection, which is often a different provider, and one env pair can
     # only carry one credential. The imagegen skill's wrapper reads these and passes them to the
