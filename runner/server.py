@@ -1675,7 +1675,8 @@ def _write_skills(cwd: str, skills: list[dict], backend: str = "claude") -> list
         rootrels = [str(_ZEROCLAW_AGENT_WS / "skills")]
         entryroot = str(_ZEROCLAW_AGENT_WS / "skills")
     else:
-        # dsh has no skill loader; the AGENTS.md block below is the only door.
+        # dsh's driver copies these into dsh's own skill root each turn (dsh_driver._install_skills), where its
+        # `skill` tool finds them; the AGENTS.md block below names them.
         # aider lands here on purpose too, and for a stronger reason: it has no skill loader AND no
         # instruction-file discovery, so its turn builder passes every file under this directory to
         # --read explicitly. Under .harness/ the bundle is excluded from produced files, so a skill
@@ -4623,6 +4624,117 @@ def _effort_shape_refused(data: bytes) -> bool:
     return bool(_EFFORT_SHAPE_REFUSED_RE.search(data or b""))
 
 
+# ── the images a conversation carries, fitted to what the model takes ────────────────────
+# A harness replays its whole conversation on every call, images included: a deck agent renders its slides
+# and looks at them on every turn, and each look stays in the history. A model that reads text only refuses
+# the next call outright, and a model with an image limit refuses it once the history passes that limit, so a
+# switch to such a model mid-conversation failed every turn after (2026-10-27, Deep Agents Code on the hosted
+# service, all three on Vercel's route): qwen3.7-max "Unexpected item type in content", nemotron-3-super "This
+# model doesn't support the image content block that you provided", mistral-medium-3.5 "Total number of images
+# exceeds the maximum allowed of 8". The call is sent with the images the model can take: none for a model
+# that reads text only, the most recent N for a model that takes N (the earlier looks were already answered in
+# the conversation's own words), each one not sent replaced by a line that says so. Known limits apply before
+# the first call; a refusal that says the model takes no image, or names its limit, is learned for the
+# (upstream host, model) for the life of the process and the call goes once more, fitted.
+_IMAGE_PARTS = {"input_image": "input_text", "image_url": "text", "image": "text"}   # image part -> its text part
+_IMAGES_NONE = frozenset({"qwen3.7-max", "glm-5.3", "nemotron-3.5-lightning", "nemotron-3-super"})
+_IMAGES_CAP_FAMILIES = ((re.compile(r"^(?:mistral|magistral|devstral|pixtral|ministral|codestral)\b"), 8),)  # Mistral's 8 a request
+_IMAGES_CAP_SEEN: dict[tuple[str, str], int] = {}
+_IMAGES_LIMIT_RE = re.compile(rb"(?:number of images|images?)\b[^0-9\"]{0,60}?(?:maximum|max|limit|more than|up to|at most)"
+                              rb"[^0-9\"]{0,20}?(\d{1,4})", re.I)
+_IMAGES_NONE_RE = re.compile(rb"doesn't support the image|does not support (?:the )?image|not support(?:s|ed)? (?:image|vision)"
+                             rb"|image input is not supported|Unexpected item type in content"
+                             rb"|No endpoints found that support image input", re.I)
+# OpenRouter says a model takes no image with a 404, "No endpoints found that support image input" (nemotron-3-super
+# and nemotron-3.5-lightning, 2026-10-26/27), where the others answer 400; the rung reads all of them.
+_IMAGES_REFUSED_STATUS = (400, 404, 413, 422)
+_IMAGE_NOT_SENT = "[An image from earlier in this conversation is not shown here.]"
+_IMAGE_TEXT_ONLY = "[An image is not shown here: this model reads text only.]"
+
+
+def _is_image_part(x: object) -> bool:
+    # `type` is read as a string only: a tool's JSON schema may have a property named `type`, whose value is a
+    # schema object, and a dict there failed the lookup and with it the whole request (0.37.5 to 0.37.6)
+    t = x.get("type") if isinstance(x, dict) else None
+    return isinstance(t, str) and t in _IMAGE_PARTS and (t != "image" or "source" in x)
+
+
+def _image_cap(model: str, route: tuple[str, str]) -> int | None:
+    """How many images the model on this route takes in one call: 0, a number, or None (no known limit)."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    caps = [_IMAGES_CAP_SEEN[route]] if route in _IMAGES_CAP_SEEN else []
+    if bare in _IMAGES_NONE:
+        caps.append(0)
+    caps += [n for rx, n in _IMAGES_CAP_FAMILIES if rx.match(bare)]
+    return min(caps) if caps else None
+
+
+def _images_refused(refused: bytes) -> int | None:
+    """The image count a provider's refusal allows: its stated limit, 0 when it takes no image, None when the
+    refusal is not about images."""
+    m = _IMAGES_LIMIT_RE.search(refused or b"")
+    if m:
+        return int(m.group(1))
+    return 0 if _IMAGES_NONE_RE.search(refused or b"") else None
+
+
+def _fit_images(body: bytes, cap: int) -> bytes:
+    """The request with at most `cap` image parts, the most recent kept; each earlier one becomes a text part of
+    the same shape (Responses input_text, chat and Messages text). Any shape: the parts are found wherever they
+    sit (a message's content, a tool result's output). Returned byte for byte when nothing is over the cap."""
+    if not body or (b"image" not in body):
+        return body
+    try:
+        doc = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body
+    found: list[tuple[list, int]] = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for i, v in enumerate(x):
+                if _is_image_part(v):
+                    found.append((x, i))
+                else:
+                    walk(v)
+
+    walk(doc)
+    over = len(found) - max(cap, 0)
+    if over <= 0:
+        return body
+    for parent, i in found[:over]:
+        parent[i] = {"type": _IMAGE_PARTS[parent[i]["type"]], "text": _IMAGE_TEXT_ONLY if cap <= 0 else _IMAGE_NOT_SENT}
+    return json.dumps(doc).encode()
+
+
+def _image_count(body: bytes) -> int:
+    """How many image parts the request carries (0 for a body that is not JSON)."""
+    if not body or b"image" not in body:
+        return 0
+    try:
+        doc = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return 0
+    n = 0
+
+    def walk(x):
+        nonlocal n
+        if _is_image_part(x):
+            n += 1
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(doc)
+    return n
+
+
 def _set_reasoning_effort_none(body: bytes) -> bytes:
     """Set `reasoning_effort: "none"` in one chat-completions body.
 
@@ -4845,6 +4957,41 @@ def _refused_top_level_field(refused: bytes) -> str:
 # for brokered traffic.
 _GOOGLE_SIG_SKIP = "skip_thought_signature_validator"
 _GOOGLE_HOST = "generativelanguage.googleapis.com"
+
+# A signature belongs to the model that made it. A conversation that moves from one Gemini model to another
+# replays the first model's calls, and Google refuses the second model's request when they carry the first
+# one's signatures: 400 "Corrupted thought signature." (hosted, 2026-10-27: a fast-agent deck conversation,
+# gemini-4-argon's turn, then gemini-3.6-flash, 3.5-flash, 3.5-flash-lite and 3.1-pro-preview each refused
+# twice; fast-agent keeps the signatures in its own history). So the relay keeps, for the life of the
+# process, which model made each tool call it saw a signature for, and a replayed call made by another model
+# goes with Google's sentinel instead, whether the signature came from this relay or from the harness.
+# OpenRouter's encrypted reasoning is the same: another model's entry is not put back. A route lives one
+# turn, so this is kept beside the routes. A signature whose maker this process never saw (a runner
+# restarted since) is kept as the harness sent it, and if Google calls it corrupted the call goes once more
+# with the sentinel in its place. The hosted broker keeps the same record per session.
+_SIG_MAKERS: dict[str, str] = {}
+_SIG_MAKERS_MAX = 50_000
+_SIG_MAKERS_LOCK = threading.Lock()
+_GOOGLE_SIG_CORRUPT_RE = re.compile(rb"Corrupted thought signature", re.I)
+
+
+def _sig_makers_keep(ids, model: str) -> None:
+    """Note `model` as the maker of each tool call id (the oldest notes go past _SIG_MAKERS_MAX)."""
+    if not model:
+        return
+    with _SIG_MAKERS_LOCK:
+        for cid in ids:
+            if cid:
+                _SIG_MAKERS.pop(str(cid), None)
+                _SIG_MAKERS[str(cid)] = model
+        while len(_SIG_MAKERS) > _SIG_MAKERS_MAX:
+            del _SIG_MAKERS[next(iter(_SIG_MAKERS))]
+
+
+def _sig_by_another(cid: str, want: str) -> bool:
+    """Whether the call `cid` was made by a model other than `want`, as far as this process saw."""
+    maker = _SIG_MAKERS.get(cid, "") if cid else ""
+    return bool(maker and want) and not _same_model(want, maker)
 
 
 # The relay's route carries no provider, only the upstream: a Gemini channel is known by its host.
@@ -5121,9 +5268,13 @@ def _google_signatures_in_line(line: bytes) -> list[tuple[str, str]]:
     return _google_signatures_in(doc) if isinstance(doc, dict) else []
 
 
-def _google_with_signatures(body: bytes, sigs: dict) -> bytes:
+def _google_with_signatures(body: bytes, sigs: dict, distrust: bool = False, fill: bool = True) -> bytes:
     """The request with every replayed assistant tool call carrying a thought signature: the one
-    this relay saw on the answer, else Google's sentinel. A body without tool calls is untouched."""
+    this relay saw on the answer, else Google's sentinel. A call another model made goes with the
+    sentinel even when the harness carried its signature (_SIG_MAKERS); with `distrust` (Google called
+    a signature corrupted), so does every call whose maker this process never saw. Without `fill`
+    (a route not known to be Google's) only signatures the harness carried are looked at. A body
+    without tool calls is untouched."""
     if b"tool_calls" not in body:
         return body
     try:
@@ -5132,6 +5283,7 @@ def _google_with_signatures(body: bytes, sigs: dict) -> bytes:
         return body
     if not isinstance(doc, dict) or not isinstance(doc.get("messages"), list):
         return body
+    want = str(doc.get("model") or "")
     changed = False
     for msg in doc["messages"]:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -5139,11 +5291,16 @@ def _google_with_signatures(body: bytes, sigs: dict) -> bytes:
         for tc in msg.get("tool_calls") or []:
             if not isinstance(tc, dict):
                 continue
-            ec = tc.get("extra_content")
-            if isinstance(ec, dict) and isinstance(ec.get("google"), dict) and ec["google"].get("thought_signature"):
-                continue
             cid = str(tc.get("id") or "")
-            tc["extra_content"] = {"google": {"thought_signature": sigs.get(cid) or _GOOGLE_SIG_SKIP}}
+            own = not _sig_by_another(cid, want) and not (distrust and cid not in _SIG_MAKERS)
+            ec = tc.get("extra_content")
+            carried = isinstance(ec, dict) and isinstance(ec.get("google"), dict) and ec["google"].get("thought_signature")
+            if (carried and own) or (not carried and not fill):
+                continue
+            sig = (sigs.get(cid) if own else "") or _GOOGLE_SIG_SKIP
+            if carried == sig:
+                continue
+            tc["extra_content"] = {"google": {"thought_signature": sig}}
             changed = True
     return json.dumps(doc).encode() if changed else body
 
@@ -5191,12 +5348,14 @@ def _with_encrypted_reasoning(body: bytes, held: dict) -> bytes:
         return body
     if not isinstance(doc, dict) or not isinstance(doc.get("messages"), list):
         return body
+    want = str(doc.get("model") or "")
     changed = False
     for msg in doc["messages"]:
         if not isinstance(msg, dict) or msg.get("role") != "assistant" or msg.get("reasoning_details"):
             continue
+        # another model's encrypted reasoning is not put back (see _SIG_MAKERS)
         got = [held[cid] for cid in (str(tc.get("id") or "") for tc in msg.get("tool_calls") or []
-                                     if isinstance(tc, dict)) if cid in held]
+                                     if isinstance(tc, dict)) if cid in held and not _sig_by_another(cid, want)]
         if got:
             msg["reasoning_details"] = got
             changed = True
@@ -5874,8 +6033,11 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
             body = _with_encrypted_reasoning(body, flags["encrypted_reasoning"])
             headers["content-length"] = str(len(body))
         google = _GOOGLE_HOST in base or bool(flags.get("thought_signature"))
-        if google and body is not None and self.path.endswith("/chat/completions"):
-            body = _google_with_signatures(body, flags.setdefault("google_sigs", {}))
+        if ((google or (body is not None and b"thought_signature" in body))
+                and body is not None and self.path.endswith("/chat/completions")):
+            # on any route, a carried signature another model made is not sent (see _SIG_MAKERS)
+            body = _google_with_signatures(body, flags.setdefault("google_sigs", {}),
+                                           distrust=bool(flags.get("sig_distrust")), fill=google)
             headers["content-length"] = str(len(body))
         if ((((_gemini_channel(base) or flags.get("gemini_schemas"))
               and "gemini" in str(_body_model).lower())
@@ -5898,6 +6060,15 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
             fixed = _with_anthropic_schemas(body)
             if fixed != body:
                 body = fixed
+                headers["content-length"] = str(len(body))
+        # The conversation's images, as many as this model takes (_IMAGE_PARTS): known limits now, a
+        # refused count learned below. Before the level, so the body kept without it is fitted too.
+        image_route = ((urllib.parse.urlsplit(base).hostname or "").lower(), str(_body_model))
+        image_cap = _image_cap(str(_body_model), image_route) if body is not None else None
+        if image_cap is not None:
+            fitted = _fit_images(body, image_cap)
+            if fitted is not body:
+                body = fitted
                 headers["content-length"] = str(len(body))
         # The thinking level the turn asked for, written the way this route and this model take it
         # (runner/reasoning.py). Last of the body's changes, so it is what the provider reads. A
@@ -5944,6 +6115,18 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
                     headers["content-length"] = str(len(body))
                     continue
                 effort_back = False
+                # A refusal of the conversation's images (none taken, or more than the model's limit):
+                # learned for this route and sent once more with the images it takes. Any other
+                # refusal goes on to the repairs below.
+                sent_images = _image_count(body) if attempt < 2 and e.code in _IMAGES_REFUSED_STATUS else 0
+                allowed = _images_refused(data) if sent_images else None
+                if allowed is not None and allowed < sent_images:
+                    _IMAGES_CAP_SEEN[image_route] = min(allowed, _IMAGES_CAP_SEEN.get(image_route, allowed))
+                    body = _fit_images(body, allowed)
+                    headers["content-length"] = str(len(body))
+                    print(f"[relay] provider refused {sent_images} images for model={_body_model}; sent again "
+                          f"with at most {allowed}, and at most {allowed} from now on on this route", flush=True)
+                    continue
                 bare = (_without_chat_cache(body) if body is not None and flags.get("chat_cache")
                         and self.path.endswith("/chat/completions") else None)
                 if (attempt < 2 and e.code in (400, 422) and _cache_control_refused(data)
@@ -6078,6 +6261,20 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
                 # printed only its own "↻ Resumed session" line when Vercel refused gpt-6.1-sol for
                 # a spent budget (2026-10-13), and that line was the turn's whole error.
                 flags["last_refusal"] = _refusal_words(e.code, data)
+                distrusted = (_google_with_signatures(body, flags.setdefault("google_sigs", {}), distrust=True)
+                              if (attempt < 2 and e.code == 400 and body is not None and not flags.get("sig_distrust")
+                                  and _GOOGLE_SIG_CORRUPT_RE.search(data or b"")
+                                  and self.path.endswith("/chat/completions")) else None)
+                if distrusted is not None and distrusted != body:
+                    # Google called a replayed signature corrupted: one whose maker this process never saw
+                    # (see _SIG_MAKERS) goes as the sentinel, for this turn's calls from now on.
+                    flags["sig_distrust"] = flags["thought_signature"] = True
+                    google = True
+                    body = distrusted
+                    headers["content-length"] = str(len(body))
+                    print(f"[relay] provider called a thought signature corrupted for model={_body_model}; "
+                          f"sent again with the sentinel for calls of unknown origin", flush=True)
+                    continue
                 if (attempt < 2 and e.code == 400 and b"thought_signature" in data
                         and not flags.get("thought_signature") and body is not None):
                     # a Gemini 3 endpoint this relay did not recognise as Google names the need itself
@@ -6287,12 +6484,14 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
                         call_thinking = seen_thinking
                     for rd in _encrypted_reasoning_in_line(line):
                         flags.setdefault("encrypted_reasoning", {})[str(rd["id"])] = rd
+                        _sig_makers_keep([rd["id"]], str(_body_model))
                     if flags.get("turn_reasoning_only"):
                         flags.setdefault("items_minted", set()).update(_output_item_ids_in_line(line))
                     if sigs is not None:
                         for cid, sig in _google_signatures_in_line(line):
                             sigs[cid] = sig
                             flags["thought_signature"] = True
+                            _sig_makers_keep([cid], str(_body_model))
                 if out_lines is not None:
                     chunk = b"".join(out_lines)
                 _stream_fold(flags, call_usage, call_thinking, folded)   # on the route before the client has it
@@ -6363,6 +6562,7 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
                 try:
                     for rd in _encrypted_reasoning_in(json.loads(data)):
                         flags.setdefault("encrypted_reasoning", {})[str(rd["id"])] = rd
+                        _sig_makers_keep([rd["id"]], str(_body_model))
                 except (ValueError, UnicodeDecodeError):
                     pass
             if sigs is not None and b"thought_signature" in data:
@@ -6375,6 +6575,7 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
                     sigs.update(found)
                     if found:
                         flags["thought_signature"] = True
+                        _sig_makers_keep([cid for cid, _ in found], str(_body_model))
             self.send_header("content-length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -13226,6 +13427,91 @@ def _fast_agent_drop_media(cwd: str, session_id: str, model: str) -> int:
     return removed
 
 
+# What fast-agent itself believes a model id reads, as `--model generic.<id>` resolves it with no overlay:
+# its input types and its limits, or None for an id its table does not have. MEASURED on 0.10.47
+# (2026-10-27): an id it does not know is text only to it (ModelInfo's fallback, tokenizes
+# ["text/plain"]), so `enable_attach_media: auto` hid attach_media and every image was filtered out of
+# the messages. 65 of the ids this base sends were unknown, among them every dotted Claude id
+# (claude-opus-5.5; its table spells claude-opus-5-5) and gemini, grok, qwen, mistral and deepseek ids
+# whose channels take images: Claude on fast-agent never saw an image. Asked of fast-agent's own python
+# and table, once per id per process (0.8 s).
+_FA_PROBE = (
+    "import json, os, sys, tempfile\n"
+    "os.environ['FAST_AGENT_HOME'] = tempfile.mkdtemp()\n"
+    "from fast_agent.llm.model_factory import ModelFactory\n"
+    "r = ModelFactory.resolve_model_spec('generic.' + sys.argv[1])\n"
+    "i = r.build_model_info() if r.model_params is not None else None\n"
+    "print(json.dumps(None if i is None else {'tokenizes': list(i.tokenizes or [])}))\n")
+_FA_KNOWN: dict[str, dict | None] = {}
+# The image types a model whose channel takes images is declared to read (the gateway's `vision`).
+_FA_IMAGES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+# Limits for an id fast-agent does not know. Its overlay is used only when it names both, and it then
+# sends the cap as max_tokens, which an id it does not know never carried: the turn's route drops it
+# again, so the provider's own default applies as before. The window only sets where its compaction
+# starts, which for an unknown id was never: one no model here reaches keeps it there.
+_FA_UNKNOWN_LIMITS = {"context_window": 2_000_000, "max_output_tokens": 128_000}
+# One file, rewritten every turn: a resumed session names the same `generic.<id>`, so it reads this
+# turn's file, never a stale one.
+_FA_OVERLAY_FILE = "harness-turn.yaml"
+# How long fast-agent waits for its stream to start and between its events. Its own default is 150 s
+# (300 s at a high reasoning effort), shorter than the relay's wait upstream: a gemini-4-argon turn with
+# a long conversation of images failed after 291 s on fast-agent's own "OpenAI stream did not start
+# within 150.0 seconds" while the provider was still working (hosted, 2026-10-27). The relay's wait
+# decides, and fast-agent's is a little longer, so the relay's answer, which says what happened, is the
+# one that arrives.
+_FA_STREAM_WAIT_S = HR_RELAY_UPSTREAM_TIMEOUT_S + 30
+
+
+def _fast_agent_known(model: str) -> dict | None | bool:
+    """fast-agent's own view of `model` (see _FA_PROBE); False when it could not be asked, which leaves
+    the turn exactly as it was before overlays."""
+    if model in _FA_KNOWN:
+        return _FA_KNOWN[model]
+    try:
+        out = subprocess.run([FAST_AGENT_PYTHON, "-I", "-c", _FA_PROBE, model], capture_output=True,
+                             text=True, timeout=60, cwd=tempfile.gettempdir())
+        view = json.loads(out.stdout.strip().splitlines()[-1]) if out.returncode == 0 else False
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        view = False
+    if view is not False and not (view is None or isinstance(view, dict)):
+        view = False
+    if view is not False:
+        _FA_KNOWN[model] = view
+    return view
+
+
+def _fast_agent_overlay(home: pathlib.Path, model: str, vision: bool) -> bool:
+    """This turn's model as fast-agent should take it: a model overlay named exactly as the runner's
+    `--model` (`generic.<id>`) in `<home>/model-overlays/`. fast-agent resolves the name to the overlay
+    and the id it sends upstream is unchanged (measured on 0.10.47). It always carries the stream wait
+    (_FA_STREAM_WAIT_S), and what the model reads where fast-agent's own table says otherwise.
+
+    The gateway knows whether the model's channel takes images (`vision`, from _TEXT_ONLY_INPUT);
+    fast-agent decides from its own table whether to offer attach_media and whether to keep an image in
+    a message. Where the two disagree the overlay carries the gateway's answer. An id it knows keeps
+    its own limits and every other type it reads; an id it does not know gets _FA_UNKNOWN_LIMITS.
+    Returns True when the overlay carries those made-up limits, so the route drops the cap."""
+    path = home / "model-overlays" / _FA_OVERLAY_FILE
+    known = _fast_agent_known(model)
+    takes = list(known["tokenizes"]) if isinstance(known, dict) else ["text/plain"]
+    if vision:
+        # a model it already lets read images keeps its own list
+        want = takes if any(str(t).startswith("image/") for t in takes) else takes + list(_FA_IMAGES)
+    else:
+        # a channel that refuses images: text alone, as _fast_agent_drop_media leaves the history
+        want = ["text/plain"]
+    reads = known is not False and want != takes
+    doc = {"name": f"generic.{model}", "provider": "generic", "model": model,
+           "defaults": {"streaming_timeout": _FA_STREAM_WAIT_S}}
+    if reads:
+        doc["metadata"] = {"tokenizes": want, **({} if known else _FA_UNKNOWN_LIMITS)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".yaml.hr-tmp")
+    tmp.write_text(json.dumps(doc), encoding="utf-8")       # JSON is YAML; fast-agent reads it with yaml
+    os.replace(tmp, path)
+    return reads and not known
+
+
 def _fast_agent_config(cwd: str, tools_disabled: list[str] | None,
                        mcp_servers: list[dict] | None, base_url: str = "") -> tuple[pathlib.Path, list[str]]:
     """Write the fastagent.config.yaml this turn runs with, and name the servers it declares.
@@ -13325,11 +13611,17 @@ def _build_fast_agent(provider: str, auth: Auth, model: str, prompt: str, cwd: s
                                  f"(one of {sorted(FAST_AGENT_PROVIDERS)})")
     if not auth.base_url:
         raise HTTPException(400, f"fast-agent provider '{pr}' needs a base_url (none configured)")
-    if auth.api_key:
-        relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key, chat_cache=True)
-        auth = auth.model_copy(update={"base_url": relay_base, "api_key": relay_tok})
     home = _fast_agent_home(cwd)
     home.mkdir(parents=True, exist_ok=True)
+    if auth.api_key:
+        # the stream wait, and what the model reads where fast-agent's own table disagrees
+        # (_fast_agent_overlay); only through the relay, whose wait it is and which takes back the
+        # cap made-up limits would add
+        made_up = _fast_agent_overlay(home, model, vision)
+        relay_base, relay_tok = _hermes_relay_route(
+            auth.base_url, auth.api_key, chat_cache=True,
+            drop_fields=("max_tokens", "max_completion_tokens") if made_up else ())
+        auth = auth.model_copy(update={"base_url": relay_base, "api_key": relay_tok})
     cfg, server_names = _fast_agent_config(cwd, tools_disabled, mcp_servers, base_url=auth.base_url or "")
     env["FAST_AGENT_HOME"] = str(home)
     env[_FA_BASE_ENV] = (auth.base_url or "").rstrip("/")

@@ -8486,7 +8486,12 @@ _BARE_MODELS = {"", "claude", "codex", "anthropic", "bedrock", "openai", "hermes
 # a degraded answer beats a dead conversation. dsh, omp and fast-agent read the same flag (fast-agent
 # keeps an image in its history under the model that attached it; the runner takes it out of the
 # stored conversation before a text-only model loads it).
-_TEXT_ONLY_INPUT = {"qwen3.7-max", "glm-5.3", "nemotron-3.5-lightning"}
+# 2026-10-27, nemotron-3-super, one image part through the test instance's own connections (and on the hosted
+# service's Vercel route after a deck agent had looked at its slides):
+#   Vercel     -> 400 "This model doesn't support the image content block that you provided."
+#   OpenRouter -> 404 "No endpoints found that support image input"
+# The same request without the image answered on both.
+_TEXT_ONLY_INPUT = {"qwen3.7-max", "glm-5.3", "nemotron-3.5-lightning", "nemotron-3-super"}
 # Union of BOTH tables' values — a dict merge would drop the bedrock ids (shared keys, anthropic
 # values win), silently rejecting the us.anthropic.* ids this set exists to allow.
 _PROVIDER_CLAUDE_IDS = {v.lower() for v in [*_BEDROCK_CLAUDE.values(), *_ANTHROPIC_CLAUDE.values()]}
@@ -18447,9 +18452,11 @@ _BASE_CATALOG: dict[str, dict] = {
         # on 2026-09-08 (goal, plan, job and agent-messaging internals left out). No per-tool
         # switch exists on the wire, so disabling is an instruction to the model, the same
         # standing as codex/hermes.
+        # web_search is not offered: dsh's stock provider calls DeepSeek's own API with the relay's placeholder
+        # key (401 every time, and off the turn's connection), so the driver turns that row off.
         "tools": [("bash", "Bash"), ("read", "File Read"), ("write", "File Write"),
                   ("edit", "Edit"), ("str_replace_editor", "String Replace Editor"),
-                  ("glob", "Glob"), ("grep", "Grep"), ("web_search", "Web Search"),
+                  ("glob", "Glob"), ("grep", "Grep"),
                   ("web_fetch", "Web Fetch"), ("todo_write", "Todo"), ("skill", "Skill"),
                   ("subagent", "Subagent"), ("subagent_fork", "Subagent (fork)"),
                   ("workflow", "Workflow")],
