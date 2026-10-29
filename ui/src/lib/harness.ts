@@ -170,7 +170,7 @@ export const OOB: OobHarness[] = [
     // Placeholder only: the gateway's catalog wins once fetched. MiniMax's own model first and the
     // default; the rest is kimi's relay reach, offered so the matrix can measure it on this base (no
     // minimax column has run yet). _MODEL_CATALOG["minimax"] says which ids were measured.
-    models: ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2', 'claude-fable-5-1', 'claude-fable-5', 'claude-opus-5.5', 'claude-opus-5', 'claude-sonnet-5.5', 'claude-sonnet-5', 'claude-opus-4.8', 'claude-opus-4.7', 'claude-sonnet-4.6', 'claude-haiku-5.5', 'claude-haiku-4.5', 'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'grok-4.6', 'grok-4.5', 'grok-4.3', 'grok-4.20', 'grok-build-0.1', 'muse-wonder-1.0', 'muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.1', 'muse-glimmer-30b', 'llama-3.3-70b', 'deepseek-v4.1-flash', 'deepseek-v4-pro', 'deepseek-v4-flash', 'kimi-k3', 'kimi-k2.7-code', 'qwen3.8-max', 'qwen3.8-flash', 'qwen3.8-27b', 'qwen3.7-max', 'qwen3.7-plus', 'glm-5.3', 'glm-5.3-flash', 'mistral-medium-3.5', 'step-3.7-flash', 'hunyuan-4-preview', 'minimax-m3', 'nemotron-3.5-lightning', 'nemotron-3-super'], defaultModel: 'minimax-m3', moreModels: 0,
+    models: ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2', 'claude-fable-5-1', 'claude-fable-5', 'claude-opus-5.5', 'claude-opus-5', 'claude-sonnet-5.5', 'claude-sonnet-5', 'claude-opus-4.8', 'claude-opus-4.7', 'claude-sonnet-4.6', 'claude-haiku-5.5', 'claude-haiku-4.5', 'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'grok-4.6', 'grok-4.5', 'grok-4.3', 'grok-4.20', 'grok-build-0.1', 'muse-wonder-1.0', 'muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.1', 'muse-glimmer-30b', 'llama-3.3-70b', 'deepseek-v4.1-flash', 'deepseek-v4-pro', 'deepseek-v4-flash', 'kimi-k3', 'kimi-k2.7-code', 'qwen3.8-max', 'qwen3.8-flash', 'qwen3.8-27b', 'qwen3.7-max', 'qwen3.7-plus', 'glm-5.3', 'glm-5.3-flash', 'mistral-medium-3.5', 'step-3.7-flash', 'hunyuan-4-preview', 'minimax-m3.1-flash', 'minimax-m3', 'nemotron-3.5-lightning', 'nemotron-3-super'], defaultModel: 'minimax-m3', moreModels: 0,
     systemPrompt: 'You are MiniMax Code, an autonomous coding agent. You work on a real git workspace with shell and file access, reading and editing files and running commands to complete the task end to end.',
     tools: [], skills: [] },
   { id: 'aider', name: 'Aider', version: 'v0.86.2', backend: 'aider', status: 'ready',
@@ -283,7 +283,9 @@ export function offeredOob(bases: Record<string, BaseInfo> | null): OobHarness[]
   return OOB.filter((o) => o.status === 'ready' && !!bases?.[o.id]);
 }
 
-export const oobById = (id: string) => OOB.find((o) => o.id === id) || null;
+/** A base by its id, or by the backend it runs: the gateway takes either for a setup's base, so a setup made through the
+ *  API can carry `claude` where the console names the base `claude-code` (its setups read "claude", with no mark). */
+export const oobById = (id: string) => OOB.find((o) => o.id === id) || OOB.find((o) => o.backend === id) || null;
 
 // ── model catalog: the GATEWAY owns it, this file does not ────────────────────────────
 // The `models` / `defaultModel` fields above are the pre-fetch placeholder only (so first paint
