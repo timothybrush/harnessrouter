@@ -90,6 +90,7 @@ from pydantic import BaseModel
 import environments   # the read-only project layer a turn may name (runner/environments.py)
 import reasoning      # how much a model thinks on a turn: levels and what sets them (runner/reasoning.py)
 import tracecontext   # the caller's W3C trace context: its checks and a child for the relay (#473)
+import ask_user_mcp   # the `ask_user` tool a base asks the person through, and what its arguments mean (#476)
 
 app = FastAPI(title="harness-runner")
 
@@ -738,7 +739,9 @@ def _turn_secrets(env: dict, names: list | None) -> list[str]:
     vals: set[str] = set()
     for n in names or []:
         v = env.get(n) if isinstance(n, str) else None
-        if v and len(str(v)) >= _SCRUB_MIN:
+        # An answer to a `secret` question (HR_INPUT_*) is scrubbed at any length: a six digit code is
+        # exactly what the person is asked for, and nothing else in the record is that value's reason to stay.
+        if v and (len(str(v)) >= _SCRUB_MIN or str(n).startswith("HR_INPUT_")):
             v = str(v)
             vals.update((v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1]))
     return sorted(vals, key=len, reverse=True)
@@ -751,7 +754,7 @@ def _turn_secrets(env: dict, names: list | None) -> list[str]:
 # gateway reads the transcript by) or a role, and erase its own transcript from the trace (reported
 # privately, GHSA-7pwj-vv9r-rh2m). The turn's own fields are kept by POSITION, not by name anywhere:
 # a tool's input is an arbitrary map, and a "type" inside it is the agent's content.
-_ANSWER_CONTENT = ("result", "error", "reason", "handoff", "events", "error_detail")
+_ANSWER_CONTENT = ("result", "error", "reason", "handoff", "events", "error_detail", "input_request")
 _ANSWER_KEEP = {
     "event": frozenset({"type", "subtype", "session_id", "uuid", "parent_tool_use_id", "model", "usage", "modelUsage",
                         "stop_reason"}),
@@ -1852,6 +1855,22 @@ def _plugin_file_is_executable(rel: str, declared: bool | None) -> bool:
     return any(p.match(rel) for p in _PLUGIN_EXEC_PATTERNS)
 
 
+def _plugin_mcp_json_for_session(raw: str) -> str:
+    """A package's mcp.json as the session gets it: its remote servers taken out. The gateway has
+    already listed them in mcp_servers, so they run through the relay (_mcp_through_relay), and this
+    file's copy would hand the agent the url and headers a package was written with. Nothing reads
+    this file during a turn: its stdio servers run from launchers, and Claude Code's --plugin-dir
+    reads .mcp.json, not this. A file that can't be read is not written as it was."""
+    try:
+        doc = json.loads(raw)
+    except (TypeError, ValueError):
+        return "{}"
+    servers = doc.get("mcpServers") if isinstance(doc, dict) else None
+    if isinstance(servers, dict):
+        doc["mcpServers"] = {k: v for k, v in servers.items() if not (isinstance(v, dict) and v.get("url"))}
+    return json.dumps(doc, indent=2)
+
+
 def _write_plugins(cwd: str, plugins: list[dict]) -> list[str]:
     """Materialize each installed plugin package whole, at its own root under
     `.harness/plugins/<name>/`, with a writable data directory beside it under
@@ -1903,6 +1922,9 @@ def _write_plugins(cwd: str, plugins: list[dict]) -> list[str]:
             if dest is None:
                 continue
             try:
+                if rel == "mcp.json":
+                    raw = base64.b64decode(content_b64).decode() if content_b64 is not None else content
+                    content, content_b64 = _plugin_mcp_json_for_session(raw), None
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 # Written beside and renamed over: a binary a still-running server has open
                 # cannot be truncated in place (ETXTBSY), and a rename replaces it regardless.
@@ -4233,6 +4255,7 @@ def _relay_forget(tokens: list | None) -> None:
         with _HERMES_RELAY["lock"]:
             for tok in tokens:
                 _HERMES_RELAY["routes"].pop(tok, None)
+                _MCP_RELAY["routes"].pop(tok, None)
 
 
 def _routes_end_with_turn(run, tokens: list | None):
@@ -4243,6 +4266,238 @@ def _routes_end_with_turn(run, tokens: list | None):
         finally:
             _relay_forget(tokens)
     return runner
+
+
+# ── MCP through the relay ─────────────────────────────────────────────────────────────────────
+# A remote MCP server's address and credentials stay in this process. The session is handed a
+# loopback address holding one token, in every config file and bridge, and that token stops working
+# when the turn ends. An agent that reads its own folder finds nothing that outlives the turn, and a
+# checkpoint carries nothing either. Before this, about 24 of the 29 bases wrote the bearer into a
+# config file in the session, and some of those files travel in the checkpoint.
+#
+# The whole upstream URL stays here, not only the headers: a server's path or query is often the
+# credential itself. So the agent names neither: /<token>/mcp and /<token>/sse are that server's one
+# URL, and /<token>/x/<id> is only an address that server itself gave in a legacy SSE `endpoint`
+# event, on its own origin. A route can't be pointed at another path of the host, so holding one
+# gives what the client protocol gives, not the credential's whole reach on that host.
+#
+# Reach: this process shares the session's network, so a route reaches nothing the session could not
+# already open. It adds only the headers this server was configured with, and those never follow a
+# redirect to another host.
+_MCP_RELAY: dict = {"server": None, "port": 0, "routes": _RelayRoutes(), "lock": threading.Lock()}
+_MCP_TOKEN_PATH = re.compile(r"^/(hr-mcp-[0-9a-f]{32})(/[^?#]*)?")
+_MCP_ENDPOINTS_PER_ROUTE = 64
+# A runtime that isn't a process here dials the server from its own cloud and can't reach this
+# address. Its driver hands the credential to that service, and no agent runs on this machine to read it.
+_MCP_AGENT_RUNS_ELSEWHERE = frozenset({"qoder"})
+_MCP_NOT_FORWARDED = frozenset({
+    "host", "content-length", "authorization", "cookie", "connection", "keep-alive", "proxy-authenticate",
+    "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "accept-encoding"})
+_MCP_NOT_RETURNED = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer",
+    "transfer-encoding", "upgrade", "date", "server", "location"})
+_MCP_EVENT_END = re.compile(rb"\r?\n\r?\n")
+_MCP_ENDPOINT_EVENT = re.compile(rb"^event:[ ]?endpoint\s*$", re.M)
+_MCP_EVENT_DATA = re.compile(rb"^data:[ ]?(.*?)\r?$", re.M)
+
+
+def _mcp_same_server(base: str, url: str) -> bool:
+    """The same host and port, or the same host moved from http to https. Never a step down."""
+    a, b = urllib.parse.urlsplit(base), urllib.parse.urlsplit(url)
+    if not b.hostname or (a.hostname or "").lower() != b.hostname.lower():
+        return False
+    if a.scheme == b.scheme:
+        return (a.port or 0) == (b.port or 0)
+    return a.scheme == "http" and b.scheme == "https"
+
+
+def _mcp_through_relay(servers: list[dict] | None) -> list[dict]:
+    """Every remote server, as the session will see it: a relay address and no credential. Runs before
+    any writer or bridge reads the list, so all of them get this without knowing about it. A stdio
+    server runs as the session and is left as it is."""
+    out: list[dict] = []
+    for s in servers or []:
+        s = s or {}
+        url = str(s.get("url") or "")
+        if not url:
+            out.append(s)
+            continue
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            print(f"[mcp] '{s.get('name')}': not an http or https server, left out of this turn", flush=True)
+            continue
+        with _MCP_RELAY["lock"]:
+            if _MCP_RELAY["server"] is None:
+                srv = _QuietHTTPServer(("127.0.0.1", 0), _McpRelayHandler)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                _MCP_RELAY["server"], _MCP_RELAY["port"] = srv, srv.server_address[1]
+            tok = "hr-mcp-" + uuid.uuid4().hex
+            _MCP_RELAY["routes"][tok] = {"url": url, "headers": _mcp_headers(s), "endpoints": {}}
+            port = _MCP_RELAY["port"]
+        sse = str(s.get("transport") or "").lower() == "sse" or parts.path.rstrip("/").endswith("/sse")
+        out.append({k: v for k, v in s.items() if k not in ("url", "auth", "headers")}
+                   | {"url": f"http://127.0.0.1:{port}/{tok}/{'sse' if sse else 'mcp'}"})
+    return out
+
+
+class _QuietHTTPServer(http.server.ThreadingHTTPServer):
+    """A client that goes away mid-call is ordinary here, and a traceback is not a place to risk a url."""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        return
+
+
+class _McpRelayHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args) -> None:   # a path here holds a route's token
+        return
+
+    def _refuse(self, status: int, message: str) -> None:
+        data = json.dumps({"error": message}).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _request_body(self) -> bytes | None:
+        if "chunked" in (self.headers.get("transfer-encoding") or "").lower():
+            parts: list[bytes] = []
+            while True:
+                size = int(self.rfile.readline().split(b";", 1)[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline().strip():     # any trailers
+                        pass
+                    return b"".join(parts)
+                parts.append(self.rfile.read(size))
+                self.rfile.readline()
+        n = int(self.headers.get("content-length") or 0)
+        return self.rfile.read(n) if n > 0 else None
+
+    def _open_upstream(self, target: str, route: dict, body: bytes | None):
+        """The upstream's answer. A redirect is followed only on the same server, because the request
+        carries its credential. None when it leaves that server, or after too many."""
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in _MCP_NOT_FORWARDED}
+        headers["Accept-Encoding"] = "identity"     # the legacy endpoint event has to be readable
+        headers.update(route["headers"])
+        for _hop in range(4):
+            req = urllib.request.Request(target, data=body, method=self.command, headers=headers)
+            try:
+                resp = _RELAY_OPENER.open(req, timeout=HR_RELAY_UPSTREAM_TIMEOUT_S)
+            except urllib.error.HTTPError as e:
+                resp = e
+            status = getattr(resp, "status", None) or resp.code
+            if status not in (301, 302, 303, 307, 308):
+                return resp, status
+            where = urllib.parse.urljoin(target, resp.headers.get("location") or "")
+            resp.close()
+            if not _mcp_same_server(target, where):
+                return None, 0
+            target = where
+        return None, 0
+
+    def _rewrite_endpoint(self, tok: str, route: dict, upstream_url: str, event: bytes) -> bytes | None:
+        """A legacy SSE server's `endpoint` event, with its address swapped for one on this relay. None
+        when the server names another host: the credential doesn't go there."""
+        m = _MCP_EVENT_DATA.search(event)
+        if not m:
+            return event
+        where = urllib.parse.urljoin(upstream_url, m.group(1).decode(errors="replace").strip())
+        if not _mcp_same_server(upstream_url, where) or len(route["endpoints"]) >= _MCP_ENDPOINTS_PER_ROUTE:
+            return None
+        key = uuid.uuid4().hex
+        route["endpoints"][key] = where
+        return event[:m.start()] + f"data: /{tok}/x/{key}".encode() + event[m.end():]
+
+    def _forward(self) -> None:
+        m = _MCP_TOKEN_PATH.match(self.path)
+        tok = m.group(1) if m else ""
+        route = _MCP_RELAY["routes"].get(tok)
+        if not route:
+            self._refuse(401, "unknown relay token")
+            return
+        tail = m.group(2) or ""
+        if tail in ("/mcp", "/sse"):
+            target = route["url"]
+        elif tail.startswith("/x/") and tail[3:] in route["endpoints"]:
+            target = route["endpoints"][tail[3:]]
+        else:
+            self._refuse(404, "this address is not part of this server")
+            return
+        body = self._request_body()
+        try:
+            resp, status = self._open_upstream(target, route, body)
+        except (OSError, http.client.HTTPException, ValueError):    # the message can name the url: not repeated
+            self._refuse(502, "could not reach this MCP server")
+            return
+        if resp is None:
+            self._refuse(502, "this MCP server redirected to another host, which the relay does not follow")
+            return
+        try:
+            self._answer(tok, route, target, resp, status)
+        except (OSError, http.client.HTTPException):               # either side went away
+            self.close_connection = True
+        finally:
+            resp.close()
+
+    def _answer(self, tok: str, route: dict, target: str, resp, status: int) -> None:
+        ctype = (resp.headers.get("content-type") or "").lower()
+        length = resp.headers.get("content-length")
+        scanning = self.command == "GET" and "text/event-stream" in ctype
+        self.send_response(status)
+        for k, v in resp.headers.items():
+            low = k.lower()
+            if low in _MCP_NOT_RETURNED or (low == "content-length" and scanning):
+                continue
+            self.send_header(k, v)
+        if scanning or length is None:
+            self.send_header("connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        if self.command == "HEAD" or status in (204, 304):
+            return
+        pending = b""
+        while True:
+            chunk = resp.read1(65536)
+            if not chunk or tok not in _MCP_RELAY["routes"]:     # a stream a process kept open ends with the turn
+                break
+            if scanning:
+                pending += chunk
+                chunk, pending, scanning, ok = self._scan_events(tok, route, target, pending)
+                if not ok:
+                    break
+            if chunk:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        if pending:
+            self.wfile.write(pending)
+            self.wfile.flush()
+
+    def _scan_events(self, tok: str, route: dict, target: str, pending: bytes) -> tuple[bytes, bytes, bool, bool]:
+        """The stream up to and including its first real event, which on a legacy server is `endpoint`:
+        → (what to send, what to hold, still scanning, whether to go on). After that it is passed through."""
+        sent = b""
+        while True:
+            m = _MCP_EVENT_END.search(pending)
+            if not m:
+                if len(pending) > 65536:
+                    return sent + pending, b"", False, True
+                return sent, pending, True, True
+            event, sep, pending = pending[:m.start()], m.group(0), pending[m.end():]
+            if all(line.startswith(b":") or not line.strip() for line in event.splitlines()):
+                sent += event + sep                                   # a comment, such as a keep-alive
+                continue
+            if _MCP_ENDPOINT_EVENT.search(event):
+                event = self._rewrite_endpoint(tok, route, target, event)
+                if event is None:
+                    return sent, b"", False, False
+            return sent + event + sep + pending, b"", False, True
+
+    # OPTIONS as well: a client probes with it, and "unsupported method" from here is not the server's answer.
+    do_GET = do_POST = do_DELETE = do_HEAD = do_OPTIONS = _forward   # noqa: N815
 
 
 def _turn_route(flags: dict) -> dict:
@@ -14972,6 +15227,54 @@ _GENERIC_STEP_BUDGET = {"codex", "dsh", "pi", "omp", "qwen", "gemini", "cline",
                         "opencode", "mimo", "kilo", "qoder"}
 
 
+# ── a question for the person ends the turn (UHP Tasks §3.2, #476) ──────────────────────────────
+# The base gets `ask_user` as one more MCP server (ask_user_mcp.py), and the runner watches the
+# stream for its call: the call's arguments are the question, and its result is the moment the
+# turn ends — not the call, so the base's own transcript holds the call and its answer as a pair,
+# which is what its resume continues from (measured on Claude Code 2.1.289: killed at the result
+# and resumed with the answer as the next prompt, the task went on). The process is stopped the
+# way the step budget stops one, and the turn's result is `incomplete` with the reason
+# `input_required` and the question beside it, which the gateway turns into the response's
+# `input_request` item.
+_ASK_SERVER_NAME = "harnessrouter"
+
+
+def _ask_user_server() -> dict:
+    """The stdio MCP server that serves `ask_user`, in the shape every MCP config writer takes."""
+    return {"name": _ASK_SERVER_NAME, "command": sys.executable,
+            "args": [str(pathlib.Path(__file__).with_name("ask_user_mcp.py"))]}
+
+
+def _is_ask_tool(name: str) -> bool:
+    """Whether a tool_use is the ask tool the runner served: the server's own name, not any tool
+    called ask_user (a customer's MCP server may have one, and it must not end the turn)."""
+    return name == f"mcp__{_ASK_SERVER_NAME}__{ask_user_mcp.TOOL_NAME}"
+
+
+def _ask_question_seen(ev: dict, state: dict) -> None:
+    """An assistant event's ask-tool calls, kept by id until their results arrive."""
+    blocks = (ev.get("message") or {}).get("content")
+    for b in blocks if isinstance(blocks, list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_use" and _is_ask_tool(str(b.get("name") or "")):
+            req, _why = ask_user_mcp.validate_request(b.get("input"))
+            if req is not None:
+                state.setdefault("_asked", {})[str(b.get("id") or "")] = req
+
+
+def _ask_question_answered(ev: dict, state: dict) -> dict | None:
+    """The question whose tool result this user event carries, if it carries one and the tool did
+    not refuse it (a refused call goes back to the model, which asks again properly)."""
+    asked = state.get("_asked") or {}
+    if not asked:
+        return None
+    blocks = (ev.get("message") or {}).get("content")
+    for b in blocks if isinstance(blocks, list) else []:
+        if (isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("is_error")
+                and str(b.get("tool_use_id") or "") in asked):
+            return asked[str(b.get("tool_use_id"))]
+    return None
+
+
 def _record_cli_session_id(rec: dict, ev: dict) -> None:
     """Remember the CLI's own conversation id from an `init` event: it is what the gateway sends
     back as the next turn's resume id, and therefore what every `--resume` is built from.
@@ -15054,6 +15357,12 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
             # The turn ended at its budget. What the CLI says while it is stopped (a remote
             # runtime's cancel, with its charge) is still the turn's account, but not its verdict.
             ev.update(subtype="error_max_turns", is_error=False)
+        if state.get("_stop") == "input_required":
+            # The turn ended at the model's question: a result the CLI wrote before the stop
+            # landed (the whole turn in one write, or a model that went on after the call) is the
+            # turn's account, and the question is its verdict.
+            ev.update(subtype="incomplete", is_error=False, reason="input_required",
+                      input_request=state.get("_input_request"))
         if not ev.get("model"):
             # The CLI did not say what ran; the relay saw the provider say it. Set before
             # the event is visible, so the gateway never reads it unlabelled.
@@ -15137,6 +15446,16 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
                 if (step_cap and not state.get("_stop") and ev.get("type") == "assistant"
                         and _count_tool_calls(ev, state) > step_cap):
                     state["_stop"] = "max_turns"
+                if not rec.get("asks"):
+                    pass
+                elif ev.get("type") == "assistant":
+                    _ask_question_seen(ev, state)
+                elif ev.get("type") == "user" and not state.get("_stop"):
+                    question = _ask_question_answered(ev, state)
+                    if question is not None:
+                        # The ask tool answered: the turn ends here, with the question (#476).
+                        state["_stop"] = "input_required"
+                        state["_input_request"] = question
             if state.get("_stop") and not state.get("_stopped") and proc.poll() is None:
                 # The turn went past its budget (a CLI with no step limit of its own, counted above
                 # or by its translator): the process is stopped here, the way a cancel stops it, so a
@@ -15167,12 +15486,14 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
             # The SAME capture the streaming loop does, because a base whose stream carries nothing
             # emits its init HERE (see _record_cli_session_id for what it cost to learn that).
             _record_cli_session_id(rec, ev)
-    if result_ev is None and state.get("_stop") == "max_turns":
-        # Stopped at its budget before the CLI said anything terminal (codex's turn.completed
-        # never comes once it is killed): the turn's result is the budget's, with what its
-        # translator or the relay counted, and no usage at all where nothing counted it.
-        result_ev = {"type": "result", "subtype": "error_max_turns", "is_error": False,
-                     "result": state.get("final", "")}
+    if result_ev is None and state.get("_stop") in ("max_turns", "input_required"):
+        # Stopped at its budget, or at the model's question (#476), before the CLI said anything
+        # terminal (codex's turn.completed never comes once it is killed; a killed claude writes
+        # no result): the turn's result is the budget's, or the question's with its reason
+        # (_settle), with what its translator or the relay counted, and no usage at all where
+        # nothing counted it.
+        result_ev = {"type": "result", "is_error": False, "result": state.get("final", ""),
+                     "subtype": "error_max_turns" if state["_stop"] == "max_turns" else "incomplete"}
         if _running_usage(state):
             result_ev["usage"] = _running_usage(state)   # the translator's count so far (pi, dsh)
         _settle(result_ev)
@@ -15194,6 +15515,9 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
     # rides the status body beside the reason so the gateway can report it without the trace.
     _ho = (result_ev or {}).get("handoff")
     rec["handoff"] = _ho if isinstance(_ho, dict) else None
+    # The question a turn ended on (#476), beside its reason `input_required`; None otherwise.
+    _iq = (result_ev or {}).get("input_request")
+    rec["input_request"] = _iq if isinstance(_iq, dict) else None
     # Never leave a failure opaque: surface the captured CLI stderr (and result-event error) so the
     # gateway/trace shows WHY it failed (throttling, model error, etc.) instead of an empty string.
     if rec["status"] in ("failed", "error", "timeout"):
@@ -16773,6 +17097,7 @@ class TurnReq(BaseModel):
                                            # which knows it when the base here is a broker's; unset = read it off the base
     traceparent: str | None = None          # the caller's W3C trace context (#473); unset = the turn has none
     tracestate: str | None = None           # its vendor state for that trace; never `baggage`
+    input_requests: bool = False            # claude: serve `ask_user`, and end the turn at its call (#476)
 
 
 @app.post("/turn")
@@ -16841,7 +17166,8 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
         # Installed plugin packages, whole, at their roots; then every stdio server a plugin declares
         # becomes a launcher every backend writer below already knows how to hand to its CLI.
         plugin_roots = _write_plugins(cwd, req.plugins)
-        req.mcp_servers = _sse_bridges(cwd, _plugin_launchers(cwd, req.mcp_servers), req.backend)
+        servers = req.mcp_servers if req.backend in _MCP_AGENT_RUNS_ELSEWHERE else _mcp_through_relay(req.mcp_servers)
+        req.mcp_servers = _sse_bridges(cwd, _plugin_launchers(cwd, servers), req.backend)
         # A package that is also a Claude Code plugin reaches the claude CLI whole through
         # --plugin-dir, which loads its skills/ itself; folding those skills into the skills
         # directory too would offer each one twice.
@@ -17171,14 +17497,22 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
                                   caller_keys=[*_caller_env(req.env),
                                                *(k for k in (req.env or {}) if isinstance(k, str) and k.startswith("HR_"))])
         else:
-            mcp_config = _write_mcp_config_claude(cwd, req.mcp_servers)
+            claude_servers = list(req.mcp_servers or [])
+            claude_tools_off = list(req.tools_disabled or [])
+            if req.input_requests:
+                # The question tool (#476), as one more MCP server; and the CLI's own
+                # AskUserQuestion is denied, so a question goes through the tool that ends the
+                # turn rather than one that waits on a terminal nobody is at.
+                claude_servers.append(_ask_user_server())
+                claude_tools_off.append("AskUserQuestion")
+            mcp_config = _write_mcp_config_claude(cwd, claude_servers)
             # Only a package that is ALSO a Claude Code plugin gets --plugin-dir; an Agent Plugins
             # package without .claude-plugin/plugin.json would make the CLI refuse the flag.
             plugin_dirs = [d for d in plugin_roots
                            if (pathlib.Path(d) / ".claude-plugin" / "plugin.json").is_file()]
             cmd = _build_claude(req.provider, auth, model, req.prompt, req.max_turns, cwd, env,
                                 resume_session_id=req.resume_session_id, mcp_config=mcp_config,
-                                disallowed_tools=req.tools_disabled, partial=bool(req.partial_messages),
+                                disallowed_tools=claude_tools_off, partial=bool(req.partial_messages),
                                 plugin_dirs=plugin_dirs)
     resume_lost = _resume_lost(backend, cmd, req.resume_session_id, cwd)
     _isolate_session(cwd)   # everything the runner just wrote into the session is the session's now
@@ -17199,7 +17533,9 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
                            # the flags of every route the turn registered (see _turn_route)
                            "routes": turn_thinking["routes"],
                            # the values the record may not carry (see get_turn)
-                           "secrets": _turn_secrets(_caller_env(req.env), req.env_secret)}
+                           "secrets": _turn_secrets(req.env or {}, req.env_secret),
+                           # served `ask_user` on this turn, so its result ends the turn (#476)
+                           "asks": bool(req.input_requests) and backend == "claude"}
         if codex_note:   # the follow-up's Codex history was not here: the transcript says so first
             _turns[turn_id]["events"].append({"type": "assistant", "_ts": time.time(),
                                               "message": {"content": [{"type": "text", "text": codex_note}]}})
@@ -17362,6 +17698,8 @@ def _turn_answer(turn_id: str, rec: dict, since: int, held: bool) -> dict:
            "error": rec.get("error"), "backend": rec["backend"], "model": rec["model"],
            "session_id": rec.get("session_id"), "reason": rec.get("reason") or "",
            "handoff": rec.get("handoff"),
+           # The question the turn ended on, with reason `input_required` (#476); None otherwise.
+           "input_request": rec.get("input_request"),
            # The harness's own account of a failure (#504): the base, the tool that failed and the
            # exception and stack frames it printed. The gateway puts the base and the tool in the
            # response's error.detail; the trace carries the rest.
