@@ -91,6 +91,7 @@ import environments   # the read-only project layer a turn may name (runner/envi
 import reasoning      # how much a model thinks on a turn: levels and what sets them (runner/reasoning.py)
 import tracecontext   # the caller's W3C trace context: its checks and a child for the relay (#473)
 import ask_user_mcp   # the `ask_user` tool a base asks the person through, and what its arguments mean (#476)
+import roder_backend   # Roder's app-server base: its builder, tool table and stream (runner/roder_backend.py)
 
 app = FastAPI(title="harness-runner")
 
@@ -627,7 +628,11 @@ def _resume_lost(backend: str, cmd: list[str], resume_session_id: str | None,
     probe = _SESSION_PRESENT.get(backend)
     if probe is None or not resume_session_id:
         return None
-    return None if probe(cwd, cmd, resume_session_id) else resume_session_id
+    # Each probe reads the CLI's own store in the session's tree, after the builders' scope has closed: as the
+    # session, so a link it planted there leads nowhere it could not read itself.
+    with _fs_as(_session_uid(cwd)):
+        present = probe(cwd, cmd, resume_session_id)
+    return None if present else resume_session_id
 
 
 def _git_exclude(ws: str, patterns: list[str], why: str) -> None:
@@ -886,12 +891,21 @@ HARNESS_STATE = ".harness"
 # 3 s, the other two with no visible cost. NOT here: opencode's npm cache, whose rebuild cost a turn
 # 20 s. The CLI home is already out of the workspace's own git history (see _git_ensure), so the tar
 # is the one place these travelled.
-_REBUILT_CACHES = (".harness/home/.omp/natives", ".harness/home/.codex/.tmp", ".harness/home/.cache/pkg")
+_REBUILT_CACHES = (".harness/home/.omp/natives", ".harness/home/.codex/.tmp", ".harness/home/.cache/pkg",
+                   # Roder 0.4.8 under RODER_DATA_DIR (.harness/roder): its code index of the workspace
+                   # (code-index/<workspace hash>/code-index.sqlite3, extension-host context.rs), the
+                   # tool and skill discovery catalog it writes at every start (discovery/,
+                   # roder-tools discovery.rs) and its provider models cache (models-cache.json,
+                   # openai-responses provider.rs). Each is made again when missing. NOT here: its
+                   # threads (the conversation), memory/ and knowledge/ (what the agent saved), and
+                   # threads/discovery-state (a thread's promoted tools).
+                   ".harness/roder/code-index", ".harness/roder/discovery", ".harness/roder/models-cache.json")
 
 # .git history travels in the tarball, so these must be git-ignored too (see _git_ensure).
 # Persist conversation transcripts ($HOME -> .harness/home: ~/.claude/projects, ~/.codex/sessions)
 # so --resume survives sandbox recycling — but NEVER persist credentials inside them.
 CHECKPOINT_EXCLUDE = [*(f"./{c}" for c in _REBUILT_CACHES),
+                      "./.harness/roder/auth", "./.harness/roder/config.toml",
                       "./tmp", "./.gcp-sa.json", "./.codex", "./.credentials.json",
                       "./.harness/claude/.credentials.json",
                       "./.harness/home/.claude/.credentials.json",
@@ -1131,12 +1145,16 @@ def _start_sidecar(sid: str, collab_url: str, room: str, token: str = "") -> Non
             entry.update(proc=None, room=None)
             return
         try:
-            pathlib.Path(file).parent.mkdir(parents=True, exist_ok=True)
-            if not pathlib.Path(file).exists():
-                pathlib.Path(file).write_text("")
+            # As the session: the blackboard and the log are in its tree, and a link it planted at either name,
+            # or at the folder holding them, leads nowhere it could not write itself. The log stays open for the
+            # sidecar, which runs as the session too.
+            with _fs_as(_session_uid(ws)):
+                pathlib.Path(file).parent.mkdir(parents=True, exist_ok=True)
+                if not pathlib.Path(file).exists():
+                    pathlib.Path(file).write_text("")
+                logf = open(os.path.join(ws, HARNESS_STATE, "sidecar.log"), "ab")  # diagnostics
             env = {**_child_env(), "COLLAB_URL": collab_url, "ROOM": room,
                    "BLACKBOARD_FILE": file, "COLLAB_TOKEN": token or ""}
-            logf = open(os.path.join(ws, HARNESS_STATE, "sidecar.log"), "ab")  # diagnostics
             entry.update(proc=subprocess.Popen(["node", _SIDECAR_JS], cwd=ws, env=env,
                                                stdout=logf, stderr=logf, **_as_session(ws)),
                          room=room, error=None)
@@ -1176,7 +1194,10 @@ _PER_TURN_CONFIG = (".harness/opencode.json", ".harness/kilo.json", ".harness/mc
                     ".harness/mcp-bridge/")
 # A base's own state directory outside the CLI home, which it rewrites on every turn (see
 # _git_ensure). Not in the checkpoint repo; in the tar like .harness/home.
-_STATE_DIRS = (".harness/nanobot/", ".harness/opensquilla/", ".harness/goose/", ".harness/zeroclaw/")
+_STATE_DIRS = (".harness/nanobot/", ".harness/opensquilla/", ".harness/goose/", ".harness/zeroclaw/",
+               # Roder's store: its threads, SQLite stores (analytics, memory, the code index) and
+               # discovery catalog change on every turn, as goose's do
+               ".harness/roder/")
 
 
 def _git_ensure(ws: str) -> None:
@@ -1238,6 +1259,7 @@ def _write_gitignore(gi: pathlib.Path) -> None:
         ".harness/agentzero/base/usr/.env", ".harness/agentzero/base/usr/secrets.env",
         *_PER_TURN_CONFIG,
         # this batch — the same files CHECKPOINT_EXCLUDE drops from the tarball
+        ".harness/roder/auth/", ".harness/roder/config.toml",
         ".harness/home/.jcode/auth.json", ".harness/home/.jcode/credentials.json",
         ".harness/home/.config/jcode/",
         ".harness/opensquilla/.env", ".harness/opensquilla/secrets.toml",
@@ -1535,8 +1557,9 @@ def _write_mcp_config_claude(cwd: str, servers: list[dict],
 
 
 def _codex_mcp_toml(servers: list[dict]) -> str:
-    """Render [mcp_servers.*] config.toml blocks for Codex's experimental remote-MCP (rmcp)
-    HTTP client. Returns '' if there are no HTTP servers to add."""
+    """Render [mcp_servers.*] config.toml blocks: url (streamable HTTP) or command (stdio). Returns
+    '' if there are no servers to add. Tables only, so the block can sit anywhere after the top-level
+    keys."""
     blocks: list[str] = []
     for s in servers or []:
         url = (s or {}).get("url")
@@ -1565,9 +1588,11 @@ def _codex_mcp_toml(servers: list[dict]) -> str:
         blocks.append("\n".join(lines))
     if not blocks:
         return ""
-    # rmcp HTTP client is opt-in in Codex; enable it when any HTTP MCP server is configured.
-    # (stdio servers need no switch; the flag is harmless beside them.)
-    return "\nexperimental_use_rmcp_client = true\n" + "\n".join(blocks) + "\n"
+    # No experimental_use_rmcp_client: an opt-in that older Codex releases needed for an HTTP server,
+    # and that 0.154 neither reads nor names (the HTTP client is built in). It was also a top-level key
+    # appended after the last table, so it landed inside whichever table came before it:
+    # [sandbox_workspace_write], a resumed session's provider alias, or the turn's own tables.
+    return "\n" + "\n".join(blocks) + "\n"
 
 
 def _skill_desc(files: list[dict]) -> str:
@@ -1706,6 +1731,9 @@ def _write_skills(cwd: str, skills: list[dict], backend: str = "claude") -> list
         # us here too — one directory, named in mimo.json.
         rootrels = [".harness/skills"]
         entryroot = ".harness/skills"
+    elif backend == "roder":
+        rootrels = [".harness/home/.codex/skills"]
+        entryroot = ".harness/home/.codex/skills"
     elif backend == "jcode":
         # ~/.jcode/skills/<name>/SKILL.md — jcode's GLOBAL skills root (tool/skill.rs names it
         # first), and $HOME is already <cwd>/.harness/home, so this is both inside a loader path
@@ -2298,35 +2326,76 @@ def _agent_doc_path(cwd: str, backend: str) -> pathlib.Path:
                                    # fast-agent has no instruction-file convention at all: the
                                    # file the runner writes is passed as the agent's instruction
                                    # with -i, which is aider's arrangement, so the name is ours.
-                                   "fast-agent")
+                                   "fast-agent", "roder")
         else "CLAUDE.md")
 
 
-def _write_agent_doc(cwd: str, backend: str, agent_doc: str | None, skills_meta: list[dict],
-                     environment: dict | None = None) -> None:
-    """Compose the agent's instruction file from (1) the harness's user-authored doc and (2) a managed
-    block: the workspace contract, always, plus an 'Available skills' section when skills are
-    installed. The user doc is the base; the managed block is appended inside HTML-comment markers.
-    Source of truth is the harness config, so this OVERWRITES any stale file each turn.
+# The largest instruction file a changed-instructions note carries. The note rides in the CLI's argv
+# with the message (or in the driver's job, one environment string), and one is capped at 128 KiB on
+# Linux. A larger file gets no note at all, and the turn says so in the log: the continued task keeps
+# the instructions it started with, and a new task reads the edit. Never a note that points at the
+# file instead: the workspace is the agent's to write, and a note says it replaces the instructions.
+_NOTE_INLINE_MAX = 64 * 1024
 
-    THE WORKSPACE CONTRACT IS ALWAYS PRESENT, so the file now always exists. Produced files are
-    collected from the session directory only (/produced runs git status in _ws), so a deliverable
-    written to an absolute path outside it — the workspace parent, /tmp, /app, $HOME — is invisible
-    to the user and is not even checkpointed. Nothing ever told the model that: four backends write
-    relative paths by habit, and the first dsh deck task (deepseek-v4-pro, 2026-08-21) saved to the
-    workspace PARENT, the user saw an empty turn, and three turns went to copying files into view.
-    An instruction is the right mechanism here: writes cannot be walled in a sandbox whose point is
-    real bash, and widening collection would ship every scratch file as a deliverable.
+# Bases whose resumed conversation keeps the instruction file it read when the conversation began,
+# and has no signal of its own to read it again: a continued turn after an edit is handed the current
+# file ahead of its message (_instructions_changed_note). Measured on the 0.40.0 image against a
+# recording stand-in (scripts/continued-instructions-check.py): each one's continued request carried
+# the first turn's instructions and not the edited ones. Where they sit: Kimi Code in its session's
+# `profile.bind` record, Grok Build in the conversation's first message, MiMo Code in its session's
+# prefix snapshot, dcode in the agent's checkpointed memory state, OpenHands in the conversation's
+# persisted agent context and system prompt event. Hermes and fast-agent are not here: each keeps
+# the prompt in a store it reads as "build it again" when the value is absent, and is told that way
+# (_hermes_forget_system_prompt, _fast_agent_forget_prompt). Nor is Qoder, whose instructions are
+# its remote Agent's system prompt, which a session keeps from the Agent version it was made with:
+# its driver hands a continued session the edit (qoder_driver.instructions_changed_note).
+_PINNED_INSTRUCTIONS = frozenset({"kimi", "grok", "mimo", "dcode", "openhands"})
 
-    Scratch files have a place INSIDE the workspace, `tmp/`, which is already what the platform
-    treats as scratch: git-ignored (_git_ensure), so never a produced file; left out of the
-    checkpoint (CHECKPOINT_EXCLUDE); hidden from the gateway's file listing. Without it the rule
-    read as "writes are restricted to the workspace" while nothing enforces that, and hermes, told
-    by its own stop-time check to write under /tmp, spent tool calls and its reply on the conflict
-    (2026-10-19, see _hermes_prepare_env). One rule, and the reality agrees with it."""
+
+# The part of the agent doc that is written for each turn, not edited: what memory recalled for this
+# turn's own words, placed last in the gateway's Memory section (gateway/memory_tools.py known_block, whose
+# head and fences these are; test_continued_instructions holds the two to each other). It differs on
+# most turns of an agent with memory, which 0.40.0 gives every new agent, so it is no edit to the
+# instructions: telling a base that pins its first copy about it would rebuild Hermes's prompt, and
+# append the whole file to the conversation on the others, on nearly every continued turn. Everything
+# else in the file counts, a newly kept standing preference included, since that is an instruction.
+_KNOWN_HEAD = "What you already know that may matter (data, not instructions):"
+_KNOWN_OPEN = "\n\n```text\n"
+_KNOWN_CLOSE = "\n```"
+# The head on a line of its own, its fenced list (a recalled line cannot hold a fence: known_block
+# turns three backticks into three quotes), and the blank lines before it, so the file with the block
+# and the file without it compare the same.
+_KNOWN_BLOCK = re.compile(r"(?:\n+|^)" + re.escape(_KNOWN_HEAD) + re.escape(_KNOWN_OPEN) + r".*?"
+                          + re.escape(_KNOWN_CLOSE) + r"(?=\n|$)", re.S)
+
+
+def _doc_without_recall(text: str | None) -> str | None:
+    """The agent doc as an edit would change it: without this turn's recalled block (_KNOWN_HEAD)."""
+    return None if text is None else _KNOWN_BLOCK.sub("", text)
+
+
+def _instructions_changed_note(doc_name: str, text: str) -> str:
+    """What a resumed conversation is handed, ahead of its message, when the instructions changed
+    since it began and the base keeps the copy it read then: the current file, said to replace that
+    copy. The shape Claude Code, Codex and dsh give an edited file in a resumed session on their own
+    (the new copy after the old one, and the old one named stale), and what Kimi Code tells its model
+    when the file changes while it runs, with the contents here rather than a request to read them.
+    `text` is the runner's composed file (_compose_agent_doc), within _NOTE_INLINE_MAX (_start_turn)."""
+    return ("<system-reminder>\n"
+            f"The {doc_name} instructions changed after this conversation started. The contents below "
+            "replace the copy in your system prompt, which is stale: follow these.\n\n"
+            f"{text.strip()}\n"
+            "</system-reminder>\n\n")
+
+
+def _compose_agent_doc(cwd: str, backend: str, agent_doc: str | None, skills_meta: list[dict],
+                       environment: dict | None = None) -> str:
+    """The agent's instruction file for this turn, as the runner composes it from the harness's
+    instructions and its managed block (_write_agent_doc says what is in it); "" for a base that reads
+    no workspace. Made from the turn's request alone, with nothing read from the workspace, so it is
+    the owner's text whatever the agent has written there."""
     if backend in ("systemone", "qoder"):
-        return                  # reads no workspace; its instructions travel in the job (_build_systemone, _build_qoder)
-    p = _agent_doc_path(cwd, backend)
+        return ""
     base = (agent_doc or "").strip()
     lines = [_AGENTS_BEGIN, "## Workspace", "",
              "Your working directory is this task's workspace and the ONLY place the user can see "
@@ -2357,14 +2426,58 @@ def _write_agent_doc(cwd: str, backend: str, agent_doc: str | None, skills_meta:
         lines.append("")
     block = "\n".join(lines).rstrip("\n") + "\n" + _AGENTS_END + "\n"
     body = ((base + "\n\n") if base else "") + block
+    body = body if body.endswith("\n") else body + "\n"
+    return body
+
+
+def _write_agent_doc(cwd: str, backend: str, agent_doc: str | None, skills_meta: list[dict],
+                     environment: dict | None = None, *, body: str | None = None) -> bool:
+    """Compose the agent's instruction file from (1) the harness's user-authored doc and (2) a managed
+    block: the workspace contract, always, plus an 'Available skills' section when skills are
+    installed. The user doc is the base; the managed block is appended inside HTML-comment markers.
+    Source of truth is the harness config, so this OVERWRITES any stale file each turn.
+
+    THE WORKSPACE CONTRACT IS ALWAYS PRESENT, so the file now always exists. Produced files are
+    collected from the session directory only (/produced runs git status in _ws), so a deliverable
+    written to an absolute path outside it — the workspace parent, /tmp, /app, $HOME — is invisible
+    to the user and is not even checkpointed. Nothing ever told the model that: four backends write
+    relative paths by habit, and the first dsh deck task (deepseek-v4-pro, 2026-08-21) saved to the
+    workspace PARENT, the user saw an empty turn, and three turns went to copying files into view.
+    An instruction is the right mechanism here: writes cannot be walled in a sandbox whose point is
+    real bash, and widening collection would ship every scratch file as a deliverable.
+
+    Scratch files have a place INSIDE the workspace, `tmp/`, which is already what the platform
+    treats as scratch: git-ignored (_git_ensure), so never a produced file; left out of the
+    checkpoint (CHECKPOINT_EXCLUDE); hidden from the gateway's file listing. Without it the rule
+    read as "writes are restricted to the workspace" while nothing enforces that, and hermes, told
+    by its own stop-time check to write under /tmp, spent tool calls and its reply on the conflict
+    (2026-10-19, see _hermes_prepare_env). One rule, and the reality agrees with it.
+
+    Answers whether the instructions changed since the last turn: a person edited them, or the
+    platform changed a section (a standing preference kept in memory, a skill, the environment). What
+    memory recalled for this turn's words is not counted (_doc_without_recall). A base that keeps the
+    copy it read when its conversation started has to be told, or a continued task goes on with the
+    old instructions (see _hermes_forget_system_prompt, _instructions_changed_note).
+
+    `body` is the text _compose_agent_doc made for this turn, when the caller keeps it: a turn hands a
+    base that keeps its first copy that same text, never the file read back (see _start_turn)."""
+    body = _compose_agent_doc(cwd, backend, agent_doc, skills_meta, environment) if body is None else body
+    if not body:
+        return False            # reads no workspace; its instructions travel in the job (_build_systemone, _build_qoder)
+    p = _agent_doc_path(cwd, backend)
     try:
         # As the session: a link it planted at the doc's name leads nowhere it could not write itself.
         with _fs_as(_session_uid(cwd)):
             # minimax's file lives in the CLI's home, which does not exist before its first turn.
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(body if body.endswith("\n") else body + "\n")
+            try:
+                before = p.read_text()
+            except (OSError, UnicodeDecodeError):
+                before = None
+            p.write_text(body)
+        return _doc_without_recall(before) != _doc_without_recall(body)
     except Exception:  # noqa: BLE001
-        pass
+        return False
 
 
 # ── auth / provider model ────────────────────────────────────────────────────────
@@ -2921,7 +3034,8 @@ def _claude_thinking_env(model: str) -> dict:
 def _build_claude(provider: str, auth: Auth, model: str, prompt: str, max_turns: int,
                   cwd: str, env: dict, resume_session_id: str | None = None,
                   mcp_config: str | None = None, disallowed_tools: list[str] | None = None,
-                  partial: bool = False, plugin_dirs: list[str] | None = None) -> list[str]:
+                  partial: bool = False, plugin_dirs: list[str] | None = None,
+                  own_memory_off: bool = False) -> list[str]:
     p = provider or "anthropic"
     if p not in CLAUDE_PROVIDERS:
         raise HTTPException(400, f"unknown claude provider '{p}' (one of {sorted(CLAUDE_PROVIDERS)})")
@@ -3033,20 +3147,38 @@ def _build_claude(provider: str, auth: Auth, model: str, prompt: str, max_turns:
     # ignored, and the console showed "Disabled" next to a tool the agent went on using. Verified
     # both ways against the CLI: with the flag the agent still ran bash; with this deny list it
     # reported having no shell tool and did not run it.
-    if disallowed_tools:
-        names = [t.split(" (")[0].strip() for t in disallowed_tools if t and t.strip()]
-        if names:
-            settings_path = cfg_dir / "settings.json"
-            try:
-                current = json.loads(settings_path.read_text()) if settings_path.exists() else {}
-                if not isinstance(current, dict):
-                    current = {}
-            except Exception:  # noqa: BLE001 — a corrupt file must not lose the restriction
-                current = {}
-            perms = current.get("permissions") if isinstance(current.get("permissions"), dict) else {}
-            perms["deny"] = names
-            current["permissions"] = perms
-            settings_path.write_text(json.dumps(current, indent=2))
+    #
+    # Reconciled on EVERY turn, not only when something is off: HOME is checkpointed, so a deny list an
+    # earlier turn wrote stayed in the file after the harness switched the tool back on, and the tool
+    # stayed withheld. Anything else the file holds is left as it is.
+    names = [t.split(" (")[0].strip() for t in (disallowed_tools or []) if t and t.strip()]
+    settings_path = cfg_dir / "settings.json"
+    try:
+        current = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        if not isinstance(current, dict):
+            current = {}
+    except Exception:  # noqa: BLE001 — a corrupt file must not lose the restriction
+        current = {}
+    perms = current.get("permissions") if isinstance(current.get("permissions"), dict) else {}
+    if names:
+        perms["deny"] = names
+    else:
+        perms.pop("deny", None)
+    if perms:
+        current["permissions"] = perms
+    else:
+        current.pop("permissions", None)
+    # Claude Code's own auto memory (a "# auto memory" section in its system prompt and a MEMORY.md it
+    # keeps under its config dir) is on by default in 2.1.280, -p included: measured, the request
+    # carried that section beside the platform's memories server. With the platform's memory attached
+    # it is off, so the agent keeps one memory; autoMemoryEnabled is the setting its loader reads
+    # before falling back to on.
+    if own_memory_off:
+        current["autoMemoryEnabled"] = False
+    else:
+        current.pop("autoMemoryEnabled", None)
+    if current or settings_path.exists():
+        settings_path.write_text(json.dumps(current, indent=2))
     if resume_session_id:
         # Only resume if the conversation file is ACTUALLY in the (re)hydrated workspace. A prior turn
         # can record a cli_session_id but fail before checkpointing its .jsonl — then `--resume <id>`
@@ -3172,6 +3304,12 @@ def _codex_web_search_off(tools_disabled: list[str] | None) -> bool:
                for x in (tools_disabled or []) if x and x.strip())
 
 
+def _codex_shell_off(tools_disabled: list[str] | None) -> bool:
+    """Whether the turn's disabled list names codex's shell, by the catalog's name or the one 0.154
+    sends the model (exec_command, with write_stdin, under unified exec)."""
+    return bool({t.lower() for t in _tool_names_off(tools_disabled)} & {"shell", "exec_command"})
+
+
 def _codex_flag(value: str | bool | None) -> bool | None:
     """Parse a connection's optional on/off flag, preserving an unset value."""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -3240,7 +3378,7 @@ def _codex_effort(model: str) -> str:
 
 def _codex_prepare_env(provider: str, auth: Auth, model: str, cwd: str,
                        env: dict, mcp_toml: str = "", resume: bool = False,
-                       tools_disabled: list[str] | None = None) -> "pathlib.Path":
+                       tools_disabled: list[str] | None = None, own_memory_off: bool = False) -> "pathlib.Path":
     """Shared codex setup for BOTH exec and app-server: write config.toml (model/provider/base_url +
     MCP), point CODEX_HOME at the checkpointed workspace, set provider auth + TMPDIR. Returns the
     CODEX_HOME dir. Mutates env."""
@@ -3309,6 +3447,17 @@ def _codex_prepare_env(provider: str, auth: Auth, model: str, cwd: str,
         # nothing). It goes before the first table header: appended at the end it would belong
         # to the last table and switch nothing (measured on rc.1: the tool stayed in the request).
         cfg = _codex_insert_top_level(cfg, 'web_search = "disabled"')
+    # Tables of this turn's own, written last, after every other table.
+    last_tables = ""
+    if _codex_shell_off(tools_disabled):
+        # The shell is a feature in codex 0.154's own table (`codex features list`: shell_tool), and
+        # off it takes the shell family out of the tools codex builds (exec_command and write_stdin
+        # under unified exec).
+        last_tables += "[features]\nshell_tool = false\n"
+    if own_memory_off:
+        # The platform's memory is attached, so codex keeps none of its own: 0.154's [memories] table
+        # (MemoriesToml) neither writes memories from a session's rollouts nor reads them into a turn.
+        last_tables += "[memories]\ngenerate_memories = false\nuse_memories = false\n"
     if resume:
         # A resumed session keeps the provider id it started under; Codex looks that id up in the
         # config and refuses to load without it ("Model provider `azure` not found", a July
@@ -3321,6 +3470,8 @@ def _codex_prepare_env(provider: str, auth: Auth, model: str, cwd: str,
                                             env_key=spec["env_key"], wire_api=auth.wire_api or "responses")
     if mcp_toml:   # owner-attached MCP servers via Codex's experimental rmcp HTTP client
         cfg += mcp_toml
+    if last_tables:
+        cfg += ("" if cfg.endswith("\n") else "\n") + last_tables
     (cfg_dir / "config.toml").write_text(cfg)
     env["CODEX_HOME"] = str(cfg_dir)
     env["TMPDIR"] = str(pathlib.Path(cwd) / "tmp")
@@ -3441,10 +3592,10 @@ def _sanitize_codex_rollout(rollouts: list[str], *, content_only: bool = True) -
 
 def _build_codex(provider: str, auth: Auth, model: str, prompt: str, cwd: str,
                  env: dict, mcp_toml: str = "", resume_session_id: str | None = None,
-                 tools_disabled: list[str] | None = None) -> tuple[list[str], str]:
+                 tools_disabled: list[str] | None = None, own_memory_off: bool = False) -> tuple[list[str], str]:
     """The exec command, and the note the transcript must carry when a follow-up's rollout is gone."""
     cfg_dir = _codex_prepare_env(provider, auth, model, cwd, env, mcp_toml, resume=bool(resume_session_id),
-                                 tools_disabled=tools_disabled)
+                                 tools_disabled=tools_disabled, own_memory_off=own_memory_off)
     # Drop --ephemeral so codex PERSISTS the rollout to $CODEX_HOME/sessions (inside the checkpointed
     # workspace) — that's what makes a follow-up history-aware. Mirror the claude resume guard: only
     # `resume <id>` if the rollout is actually present in the (re)hydrated workspace, else start fresh
@@ -3490,7 +3641,8 @@ DSH_DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsh_drive
 
 def _build_dsh(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                resume_session_id: str | None = None,
-               mcp_servers: list[dict] | None = None, vision: bool = True) -> list[str]:
+               mcp_servers: list[dict] | None = None, vision: bool = True,
+               tools_disabled: list[str] | None = None) -> list[str]:
     pr = provider or "deepseek"
     if pr not in DSH_PROVIDERS:
         raise HTTPException(400, f"unknown dsh provider '{pr}' (one of {sorted(DSH_PROVIDERS)})")
@@ -3523,7 +3675,9 @@ def _build_dsh(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env
     job = {"prompt": prompt, "model": model, "cwd": cwd,
            "session_id": resume_session_id or "",
            # a server is a url or, for a plugin's stdio server, the launcher the runner wrote
-           "mcp_servers": [s for s in (mcp_servers or []) if (s or {}).get("url") or (s or {}).get("command")]}
+           "mcp_servers": [s for s in (mcp_servers or []) if (s or {}).get("url") or (s or {}).get("command")],
+           # the profile rows that register only a disabled tool are switched off (dsh_driver._rows_off)
+           "tools_off": _tool_names_off(tools_disabled)}
     if not _DSH_DEEPSEEK_MODEL.search(model or ""):
         # Family decides the route, not the integration's name: deepseek models keep the
         # verified dsh-llm-deepseek launch path whichever endpoint serves them; every other
@@ -4347,6 +4501,54 @@ def _mcp_through_relay(servers: list[dict] | None) -> list[dict]:
         out.append({k: v for k, v in s.items() if k not in ("url", "auth", "headers")}
                    | {"url": f"http://127.0.0.1:{port}/{tok}/{'sse' if sse else 'mcp'}"})
     return out
+
+
+# The platform's own memory reaches an agent as the gateway's memories server, always at this path on the gateway
+# (gateway/app.py _memories_ensure: <origin>/v1/mcp/memories), whatever name the entry took. Read off the address the
+# gateway sent: the relay gives the session its own address for it (_mcp_through_relay).
+_PLATFORM_MEMORY_PATH = "/v1/mcp/memories"
+
+
+def _has_platform_memory(servers: list[dict] | None) -> bool:
+    for s in servers or []:
+        try:
+            path = urllib.parse.urlsplit(str((s or {}).get("url") or "")).path
+        except ValueError:
+            continue
+        if path.rstrip("/") == _PLATFORM_MEMORY_PATH:
+            return True
+    return False
+
+
+# A base's own persistent memory tools, withheld when the platform's memory is attached: with two memories the model
+# also saved into the one only the base can read, which the console never shows (Hermes on sslip, 11-09; hermes is
+# switched off in its own config, _hermes_prepare_env). Only bases whose switch withholds the tool from the model are
+# here, by the names that switch takes: cheetahclaws' measured Memory* tools (CHEETAHCLAWS_TOOLS) through its
+# `disabled_tools`, and Roder's memory and knowledge stores through its allowlist (roder_backend.TOOLS; a switch id
+# takes its whole family); Qwen Code's through permissions.deny, beside its background memory agents (_qwen_settings).
+# Claude Code's auto memory and codex's memories are settings, switched off in _build_claude and _codex_prepare_env,
+# and Gemini CLI 0.58.0 has no memory tool:
+# its experimental auto memory is pinned off in _gemini_settings. Already off on every turn, whatever is attached:
+# jcode `memory`, grok GROK_MEMORY=0,
+# agentzero's `_memory` plugin, dcode's memory auto-save, zeroclaw's memory tools (not on its allowlist), and
+# docker-agent's memory toolset (never declared).
+_OWN_MEMORY_TOOLS: dict[str, tuple[str, ...]] = {
+    "cheetahclaws": ("MemoryDelete", "MemoryList", "MemorySave", "MemorySearch", "MemoryVerify"),
+    "roder": ("memory_save", "knowledge_save"),
+    # Qwen Code 0.26.3's memory tools (ToolNames.MANAGE_MEMORY, SEARCH_MEMORY, and the older
+    # save_memory name its aliases still resolve), withheld through permissions.deny. Its background
+    # memory agents are switched off in its settings file as well (_qwen_settings, own_memory_off).
+    "qwen": ("manage_memory", "save_memory", "search_memory"),
+}
+
+
+def _own_memory_off(backend: str, tools_disabled: list[str] | None) -> list[str] | None:
+    """The turn's withheld tools with the base's own memory tools added (_OWN_MEMORY_TOOLS)."""
+    names = _OWN_MEMORY_TOOLS.get(backend)
+    if not names:
+        return tools_disabled
+    have = list(tools_disabled or [])
+    return have + [n for n in names if n not in have]
 
 
 class _QuietHTTPServer(http.server.ThreadingHTTPServer):
@@ -8273,10 +8475,42 @@ _HERMES_DEFAULT_BASE = {"anthropic": "https://api.anthropic.com/v1", "openai-api
                         "openrouter": "https://openrouter.ai/api/v1"}
 
 
+# hermes' own memory, as toolsets (hermes-agent 0.19.0 toolsets.py): `memory` (its MEMORY.md and USER.md, injected
+# into its prompt) and `session_search` (a search over its past conversations). Off when the platform's memory is
+# attached: with both, hermes also called its own memory tool, once failing silently ("Unknown action 'None'") and
+# once saving into its private store, which nobody sees in the console (sslip, 11-09).
+_HERMES_OWN_MEMORY_TOOLSETS = ("memory", "session_search")
+
+# A harness's disabled tools, as hermes toolsets (hermes-agent 0.19.0 toolsets.py). hermes switches
+# toolsets, never single tools, so a toolset is switched off only when it withholds nothing the
+# harness left on: `file` is read_file, write_file, patch and search_files, all four or none;
+# `search` is web_search alone and `web` is web_search with web_extract. `terminal` is terminal with
+# `process`, which only manages the background runs terminal starts (its own description) and has no
+# switch of its own, so it goes with terminal. Subagents inherit the parent's toolsets and its
+# disabled ones (delegate_tool._build_child_agent), so a withheld tool stays withheld below it.
+#
+# What hermes does with agent.disabled_toolsets differs by path, and the table holds on both: chat -q
+# (resume, MCP) subtracts the toolsets' tools from everything enabled, and the one-shot -z removes the
+# names from the enabled toolsets (tools_config._get_platform_tools). On -z, web_search still comes in
+# through the `browser` toolset where a search backend is configured, which is why it is asked as
+# well (_TOOLS_OFF_BY_REQUEST keeps hermes).
+_HERMES_TOOLSETS_OFF = (("file", ("read_file", "write_file", "patch", "search_files")),
+                        ("terminal", ("terminal",)),
+                        ("web", ("web_search", "web_extract")),
+                        ("search", ("web_search",)))
+
+
+def _hermes_toolsets_off(tools_disabled: list[str] | None) -> list[str]:
+    """The toolsets whose every tool the harness switched off (_HERMES_TOOLSETS_OFF)."""
+    off = set(_tool_names_off(tools_disabled))
+    return [ts for ts, tools in _HERMES_TOOLSETS_OFF if set(tools) <= off]
+
+
 def _hermes_prepare_env(provider: str | None, auth: Auth, cwd: str, env: dict,
                         model: str = "", max_turns: int | None = None,
                         mcp_servers: list[dict] | None = None,
-                        vision_auth: dict | None = None) -> list[str]:
+                        vision_auth: dict | None = None, own_memory_off: bool = False,
+                        tools_disabled: list[str] | None = None) -> list[str]:
     """Point HERMES_HOME inside the checkpointed workspace home (CODEX_HOME precedent) so the
     conversation state (state.db) survives sandbox recycling, and inject provider creds as env.
     Writes config.yaml fresh each turn (harness config is the source of truth, like the agent doc).
@@ -8315,6 +8549,16 @@ def _hermes_prepare_env(provider: str | None, auth: Auth, cwd: str, env: dict,
     if max_turns:
         # hermes 0.19.0 has no --max-turns CLI flag; agent.max_turns in config.yaml is the knob.
         cfg["agent"]["max_turns"] = int(max_turns)
+    toolsets_off = _hermes_toolsets_off(tools_disabled)
+    if own_memory_off:
+        # The toolsets come out of what the model is offered (agent.disabled_toolsets, read by the chat path a turn
+        # with MCP servers takes), and the store behind them is off too (memory.*_enabled: no MEMORY.md or USER.md
+        # in its prompt, and no background review writing to them).
+        toolsets_off = list(_HERMES_OWN_MEMORY_TOOLSETS) + toolsets_off
+        cfg["memory"] = {"memory_enabled": False, "user_profile_enabled": False}
+    if toolsets_off:
+        # with the disabled tools' own toolsets, where a toolset is wholly off (_hermes_toolsets_off)
+        cfg["agent"]["disabled_toolsets"] = toolsets_off
     if vision_auth and vision_auth.get("model"):
         # hermes asks its image questions separately from the conversation (vision_analyze, the
         # browser tools) and, left alone, asks the model the harness writes with. That made a
@@ -8458,11 +8702,33 @@ QWEN_PROVIDERS = {"anthropic", "openai", "azure", "openai-api", "tokenrouter"}
 _QWEN_DROP_FIELDS = ("max_tokens",)
 
 
-def _qwen_settings(home: pathlib.Path, mcp_servers: list[dict] | None) -> None:
-    """~/.qwen/settings.json under the redirected HOME. Only mcpServers is written (gemini-cli
-    schema: command/args/env for stdio, url/httpUrl for remote); auth stays in the ENVIRONMENT
-    (OPENAI_API_KEY / OPENAI_BASE_URL + --auth-type openai), so unlike pi and opencode no
-    credential ever lands on disk for this backend."""
+def _tool_names_off(tools_disabled: list[str] | None) -> list[str]:
+    """A harness's disabled tools as the CLI names them: a stored entry may be a display string,
+    "Name (description)", and only the part before " (" is the tool's name. Sorted, once each."""
+    return sorted({str(t).split(" (")[0].strip() for t in (tools_disabled or []) if t and str(t).strip()})
+
+
+# The tools Qwen Code 0.26.3's background agents carry in their own scoped tool sets (isScopedTool:
+# file reads, grep and listing in the memory folder, edit, write and the shell; isScopedTool2: read,
+# list, edit and write for skill review).
+_QWEN_BACKGROUND_AGENT_TOOLS = frozenset({"read_file", "grep_search", "list_directory", "edit", "write_file",
+                                          "run_shell_command"})
+
+
+def _qwen_settings(home: pathlib.Path, mcp_servers: list[dict] | None,
+                   tools_disabled: list[str] | None = None, own_memory_off: bool = False) -> None:
+    """~/.qwen/settings.json under the redirected HOME: mcpServers (gemini-cli schema:
+    command/args/env for stdio, url/httpUrl for remote) and the disabled tools. Auth stays in the
+    ENVIRONMENT (OPENAI_API_KEY / OPENAI_BASE_URL + --auth-type openai), so unlike pi and opencode
+    no credential ever lands on disk for this backend.
+
+    A disabled tool is a whole-tool rule in `permissions.deny`. Qwen Code 0.26.3 resolves every
+    tool's registration through its permission manager before the model sees it, and a tool a deny
+    rule names is "disabled": never registered, not even as a deferred tool that tool_search could
+    surface, and refused if a call names it anyway (getToolRegistrationStatus, registerLazyTool;
+    the loader merges permissions.deny with the legacy tools.exclude). --yolo does not reach this:
+    it chooses how a REGISTERED tool's call is approved, and approval is a different question from
+    whether the tool exists (scripts/tools-off-check.py measures it at the model request)."""
     qdir = home / ".qwen"
     qdir.mkdir(parents=True, exist_ok=True)
     servers: dict = {}
@@ -8491,11 +8757,32 @@ def _qwen_settings(home: pathlib.Path, mcp_servers: list[dict] | None) -> None:
     cfg: dict = {}
     if servers:
         cfg["mcpServers"] = servers
+    off = _tool_names_off(tools_disabled)
+    if off:
+        cfg["permissions"] = {"deny": off}
+    if set(off) & _QWEN_BACKGROUND_AGENT_TOOLS:
+        # Qwen Code's own background agents (memory extraction after a turn, memory consolidation,
+        # skill review) are each built with a scoped tool set that is registered whatever the deny
+        # list says (createSkillScopedAgentConfig, isScopedTool), so a switched-off file or shell
+        # tool would still be offered to them: measured, the memory extraction request carried
+        # read_file, grep_search, write_file and edit with all four off. A call is still refused
+        # (the base deny outranks the scoped allow), but the switch must not leave the tool in front
+        # of a model at all, so with any of those tools off these agents are off too. Known effect:
+        # switching a file or shell tool off on Qwen Code also turns off its own background memory
+        # and skill agents (its private memory, not the platform's).
+        cfg["memory"] = {"enableManagedAutoMemory": False, "enableManagedAutoDream": False,
+                         "enableAutoSkill": False}
+    elif own_memory_off:
+        # The platform's memory is attached, so Qwen Code keeps none of its own: no extraction after a
+        # turn and no consolidation (its memory tools are withheld through permissions.deny, by
+        # _OWN_MEMORY_TOOLS). Skill review is not memory and stays.
+        cfg["memory"] = {"enableManagedAutoMemory": False, "enableManagedAutoDream": False}
     (qdir / "settings.json").write_text(json.dumps(cfg, indent=2))
 
 
 def _build_qwen(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
-                resume_session_id: str | None = None, mcp_servers: list[dict] | None = None) -> list[str]:
+                resume_session_id: str | None = None, mcp_servers: list[dict] | None = None,
+                tools_disabled: list[str] | None = None, own_memory_off: bool = False) -> list[str]:
     pr = provider or "openai-api"
     if pr not in QWEN_PROVIDERS:
         raise HTTPException(400, f"unknown qwen provider '{pr}' (one of {sorted(QWEN_PROVIDERS)})")
@@ -8516,7 +8803,7 @@ def _build_qwen(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
     env["HOME"] = str(home)                      # sessions/skills/settings live INSIDE the workspace
     env["OPENAI_API_KEY"] = auth.api_key or ""
     env["OPENAI_BASE_URL"] = auth.base_url
-    _qwen_settings(home, mcp_servers)
+    _qwen_settings(home, mcp_servers, tools_disabled, own_memory_off=own_memory_off)
     cmd = ["qwen", "-p", prompt, "-o", "stream-json", "-m", model,
            # Resume REQUIRES an explicit auth type in non-interactive mode (verified on 0.22.1:
            # without it every -r run dies "No auth type is selected"); fresh runs take it too for
@@ -8659,7 +8946,7 @@ def _kimi_mcp_config(home: pathlib.Path, mcp_servers: list[dict] | None) -> path
 def _build_kimi(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                 resume_session_id: str | None = None, mcp_servers: list[dict] | None = None,
                 skills_dir: str | None = None, tools_disabled: list[str] | None = None,
-                max_turns: int | None = None) -> list[str]:
+                max_turns: int | None = None, instructions: str | None = None) -> list[str]:
     """Kimi Code CLI (MoonshotAI/kimi-code, 2.0.0), the successor its vendor moved Kimi CLI to.
 
     The model is defined from the ENVIRONMENT alone: with KIMI_MODEL_NAME set the CLI synthesises a
@@ -8667,7 +8954,13 @@ def _build_kimi(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
     no credential exists at rest. Measured: after a full session the data home held no trace of the
     key. Every turn rides the loopback relay, the qwen rationale unchanged: the real key never
     enters the CLI's environment, request shapes strict endpoints refuse are repaired in flight,
-    and the provider's own "model" passes through for the served-model check."""
+    and the provider's own "model" passes through for the served-model check.
+
+    `instructions` is the agent doc when it changed since the last turn. A resumed conversation keeps
+    the system prompt it was bound with, AGENTS.md included (the session's `profile.bind` record,
+    replayed on resume; the CLI notices a changed file only while it is running), so an edited doc
+    never reached a continued task. It goes ahead of the message instead (_instructions_changed_note):
+    measured on 2.0.0, the resumed request then carried the edited doc after the old one."""
     pr = provider or "openai-api"
     if pr not in KIMI_PROVIDERS:
         raise HTTPException(400, f"unknown kimi provider '{pr}' (one of {sorted(KIMI_PROVIDERS)})")
@@ -8701,8 +8994,11 @@ def _build_kimi(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
     _kimi_mcp_config(home, mcp_servers)
     # -p runs one prompt without the TUI, with automatic permission (it refuses --yolo/--auto
     # beside it); stream-json is one message per line. The process's cwd is the workspace.
+    resuming = bool(resume_session_id) and _kimi_has_session(home, resume_session_id)
+    if resuming and instructions and instructions.strip():
+        prompt = _instructions_changed_note("AGENTS.md", instructions) + prompt
     cmd = ["kimi", "-p", prompt, "--output-format", "stream-json"]
-    if resume_session_id and _kimi_has_session(home, resume_session_id):
+    if resuming:
         cmd += ["-r", resume_session_id]
     else:
         # The agent is bound when a session is created and restored on resume, and the CLI refuses
@@ -9125,7 +9421,8 @@ def _grok_config(home: pathlib.Path, model: str, base_url: str,
 def _build_grok(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                 resume_session_id: str | None = None, mcp_servers: list[dict] | None = None,
                 tools_disabled: list[str] | None = None, max_turns: int | None = None,
-                partial: bool = False) -> list[str]:
+                partial: bool = False,
+                instructions: str | None = None) -> list[str]:
     """Grok Build (1.0.41), headless: `grok -p … --output-format streaming-messages-json`, which is
     Claude Code's stream-json (system/init with session_id, assistant/user messages, a terminal
     result), so the normaliser is the claude passthrough plus two repairs (see _grok_to_claude).
@@ -9181,6 +9478,11 @@ def _build_grok(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
     env["NO_COLOR"] = "1"
     sid = (resume_session_id or "").strip().lower()
     resumed = bool(sid) and _grok_has_session(home, sid)
+    if resumed and instructions and instructions.strip():
+        # The conversation carries the AGENTS.md it read on its first turn (its first message, as
+        # always-applied workspace rules) and a resumed one reads none again: an edit is handed over
+        # with the message (_PINNED_INSTRUCTIONS).
+        prompt = _instructions_changed_note("AGENTS.md", instructions) + prompt
     # `--single=<prompt>` so a prompt that begins with a dash is the prompt, not a flag (measured).
     cmd = ["grok", f"--single={prompt}", "-m", _GROK_MODEL_KEY,
            "--output-format", "streaming-messages-json", "--always-approve"]
@@ -9490,8 +9792,17 @@ GEMINI_MODELS = ("gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash", "gemi
                  "gemini-3-flash-preview")
 
 
-def _gemini_settings(home: pathlib.Path, mcp_servers: list[dict] | None, model: str = "") -> None:
+def _gemini_settings(home: pathlib.Path, mcp_servers: list[dict] | None, model: str = "",
+                     tools_disabled: list[str] | None = None, own_memory_off: bool = False) -> None:
     """~/.gemini/settings.json under the redirected HOME.
+
+    A disabled tool goes in `tools.exclude`. Gemini CLI 0.58.0 builds the model's function
+    declarations from its registry's ACTIVE tools, and a tool whose name (or legacy alias:
+    search_file_content is grep_search) is in the exclude set is not active (ToolRegistry
+    getActiveTools / isActiveTool, fed by Config.getExcludeTools, which the loader fills from
+    settings.tools.exclude). A subagent's registry is built on the same Config and filtered the
+    same way. --approval-mode=yolo decides how an active tool's call is approved, which is a
+    separate question, so the exclusion holds under it.
 
     mcpServers uses gemini-cli's own schema (command/args/env for stdio, url/httpUrl/headers for
     remote) — the same shape _qwen_settings already writes, because qwen inherited it unchanged
@@ -9564,12 +9875,22 @@ def _gemini_settings(home: pathlib.Path, mcp_servers: list[dict] | None, model: 
                                   "modelChains": {k: own for k in ("preview", "default", "lite", "auto-preview", "auto-default")}}}
     if servers:
         cfg["mcpServers"] = servers
+    off = _tool_names_off(tools_disabled)
+    if off:
+        cfg["tools"] = {"exclude": off}
+    if own_memory_off:
+        # The platform's memory is attached. 0.58.0 has no memory tool ("There is no `save_memory`
+        # tool", its own prompt says); its one memory of its own is the experimental auto memory, an
+        # extraction agent that is off unless experimental.autoMemory is set. Pinned off here, so a
+        # default that changes in a later pin cannot give the agent a second memory.
+        cfg["experimental"]["autoMemory"] = False
     (gdir / "settings.json").write_text(json.dumps(cfg, indent=2))
 
 
 def _build_gemini(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                   resume_session_id: str | None = None, mcp_servers: list[dict] | None = None,
-                  native_model: str | None = None) -> list[str]:
+                  native_model: str | None = None, tools_disabled: list[str] | None = None,
+                  own_memory_off: bool = False) -> list[str]:
     pr = provider or "google"
     if pr not in GEMINI_PROVIDERS:
         raise HTTPException(400, f"unknown gemini provider '{pr}' (one of {sorted(GEMINI_PROVIDERS)})")
@@ -9594,7 +9915,7 @@ def _build_gemini(provider: str, auth: Auth, model: str, prompt: str, cwd: str, 
         relay_base, relay_tok = _gemini_relay_route("https://generativelanguage.googleapis.com", auth.api_key, model, "")
         env["GOOGLE_GEMINI_BASE_URL"] = relay_base
         env["GEMINI_API_KEY"] = relay_tok
-    _gemini_settings(home, mcp_servers, model)
+    _gemini_settings(home, mcp_servers, model, tools_disabled, own_memory_off=own_memory_off)
     cmd = ["gemini", "-p", prompt, "-o", "stream-json", "-m", model,
            # Load-bearing, same risk class as qwen's --yolo: gemini-cli gates tool use behind a
            # per-workspace "folder trust" prompt and an approval mode, neither of which can be
@@ -9622,8 +9943,39 @@ def _build_gemini(provider: str, auth: Auth, model: str, prompt: str, cwd: str, 
 CLINE_PROVIDERS = {"anthropic", "openai", "azure", "openai-api", "tokenrouter"}
 
 
+# Cline's own tool catalogue (3.0.60, the binary's tool ids and the names each puts in a request): the
+# "editor" id is sent as `apply_patch` for a model whose route edits by patch (gpt-5.4, measured: the
+# request carried apply_patch and no editor), and the "teams" id is these eighteen names.
+_CLINE_EDITOR_NAMES = ("editor", "apply_patch")
+_CLINE_TEAM_TOOLS = ("team_spawn_teammate", "team_shutdown_teammate", "team_status", "team_task",
+                     "team_run_task", "team_cancel_run", "team_list_runs", "team_await_runs",
+                     "team_send_message", "team_broadcast", "team_read_mailbox", "team_mission_log",
+                     "team_cleanup", "team_create_outcome", "team_attach_outcome_fragment",
+                     "team_review_outcome_fragment", "team_finalize_outcome", "team_list_outcomes")
+
+
+def _cline_disabled_tools(tools_disabled: list[str] | None) -> list[str]:
+    """The names for cline's `disabledTools`: the harness's, the editor's other name, and, with any
+    tool off, the team tools.
+
+    3.0.60 filters every tool list it builds by this setting's names (the lead's, and a spawn_agent
+    subagent's) EXCEPT a teammate's: team_spawn_teammate starts one with the full built-in tool set
+    whatever is switched off, so a switched-off tool would come straight back through a teammate.
+    The team tools go with any switched-off tool for that reason (and with Subagent, since a
+    teammate is another agent). Without team_spawn_teammate no teammate can start; the rest of the
+    family is useless without one."""
+    off = _tool_names_off(tools_disabled)
+    if not off:
+        return []
+    names = set(off)
+    if names & set(_CLINE_EDITOR_NAMES):
+        names |= set(_CLINE_EDITOR_NAMES)
+    names |= set(_CLINE_TEAM_TOOLS)
+    return sorted(names)
+
+
 def _cline_settings(home: pathlib.Path, base_url: str, api_key: str, model: str,
-                    mcp_servers: list[dict] | None) -> None:
+                    mcp_servers: list[dict] | None, tools_disabled: list[str] | None = None) -> None:
     """~/.cline/data/settings/{providers.json, cline_mcp_settings.json} under the redirected HOME.
 
     Written directly rather than through `cline auth` — the file is trivial, and a subprocess per
@@ -9673,11 +10025,31 @@ def _cline_settings(home: pathlib.Path, base_url: str, api_key: str, model: str,
             entry["transport"]["headers"] = hdrs
         servers[name] = entry
     (sdir / "cline_mcp_settings.json").write_text(json.dumps({"mcpServers": servers}, indent=2))
+    # Disabled tools: `disabledTools` in global-settings.json, beside providers.json, which 3.0.60's
+    # session builder applies to the tool list before the model sees it (E$/zj over
+    # resolveDisabledToolNames). --auto-approve decides how an offered tool's call is approved, a
+    # separate question, so the filter holds under it. Written every turn, since HOME is checkpointed
+    # and a list from an earlier turn must not outlive the harness's; anything else cline keeps in
+    # the file stays.
+    gs = sdir / "global-settings.json"
+    try:
+        cur = json.loads(gs.read_text()) if gs.exists() else {}
+    except (OSError, ValueError):
+        cur = {}
+    cur = cur if isinstance(cur, dict) else {}
+    off = _cline_disabled_tools(tools_disabled)
+    if off:
+        cur["disabledTools"] = off
+    else:
+        cur.pop("disabledTools", None)
+    if cur or gs.exists():
+        gs.write_text(json.dumps(cur, indent=2))
 
 
 def _build_cline(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                  resume_session_id: str | None = None,
-                 mcp_servers: list[dict] | None = None) -> list[str]:
+                 mcp_servers: list[dict] | None = None,
+                 tools_disabled: list[str] | None = None) -> list[str]:
     pr = provider or "openai-api"
     if pr not in CLINE_PROVIDERS:
         raise HTTPException(400, f"unknown cline provider '{pr}' (one of {sorted(CLINE_PROVIDERS)})")
@@ -9692,7 +10064,7 @@ def _build_cline(provider: str, auth: Auth, model: str, prompt: str, cwd: str, e
     home = pathlib.Path(cwd) / ".harness" / "home"
     home.mkdir(parents=True, exist_ok=True)
     env["HOME"] = str(home)          # sessions/settings/db live INSIDE the checkpointed workspace
-    _cline_settings(home, auth.base_url, auth.api_key or "", model, mcp_servers)
+    _cline_settings(home, auth.base_url, auth.api_key or "", model, mcp_servers, tools_disabled)
     # A prompt with no whitespace is parsed as a SUBCOMMAND ("Unknown command or unquoted
     # prompt: hi") and `--` does not rescue it. A trailing newline does, verified on 3.0.60,
     # and is invisible to the model.
@@ -10154,7 +10526,8 @@ def _mimo_npm(auth: Auth, model: str, pr: str) -> str:
 
 def _build_mimo(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                 resume_session_id: str | None = None, mcp_servers: list[dict] | None = None,
-                skills_dir: str | None = None, tools_disabled: list[str] | None = None) -> list[str]:
+                skills_dir: str | None = None, tools_disabled: list[str] | None = None,
+                instructions: str | None = None) -> list[str]:
     pr = provider or "openai-api"
     if pr not in MIMO_PROVIDERS:
         raise HTTPException(400, f"unknown mimo provider '{pr}' (one of {sorted(MIMO_PROVIDERS)})")
@@ -10193,6 +10566,11 @@ def _build_mimo(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
            "--thinking"]
     if resume_session_id and _opencode_has_session(env, resume_session_id, share="mimocode"):
         cmd += ["-s", resume_session_id]
+        if instructions and instructions.strip():
+            # Unlike opencode, mimo pins a session's system prompt, AGENTS.md included, in its
+            # prefix snapshot for the provider's cache, so a resumed session reads none again: an
+            # edit is handed over with the message (_PINNED_INSTRUCTIONS).
+            prompt = _instructions_changed_note("AGENTS.md", instructions) + prompt
     elif resume_session_id:
         # opencode's guard, unchanged: naming a session this database does not hold exits 1 before
         # the first event, and since every later turn passes the same dead id the conversation
@@ -11574,7 +11952,8 @@ def _openhands_mcp_config(mcp_servers: list[dict] | None) -> dict:
 def _build_openhands(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                      resume_session_id: str | None = None, mcp_servers: list[dict] | None = None,
                      tools_disabled: list[str] | None = None,
-                     max_turns: int | None = None) -> list[str]:
+                     max_turns: int | None = None,
+                     instructions: str | None = None) -> list[str]:
     """OpenHands V1, driven through `openhands-agent-server` (OpenHands/agent-sdk, MIT).
 
     NOT the CLI. PyPI `openhands` is OpenHands/openhands-cli, whose README opens with "This project
@@ -11648,6 +12027,12 @@ def _build_openhands(provider: str, auth: Auth, model: str, prompt: str, cwd: st
            # the server's own default is 500 iterations per run; an operator's budget that the
            # backend drops is the quiet lie kimi shipped at 1000 steps
            "max_turns": max_turns}
+    if instructions and instructions.strip():
+        # The conversation keeps the AGENTS.md it loaded when it was created, in its persisted agent
+        # context and its system prompt event, and a resumed one loads none again: an edit is handed
+        # over with the message. Only the driver knows whether the conversation is resumed (it asks
+        # the agent-server), so it adds this then and only then (_PINNED_INSTRUCTIONS).
+        job["instructions_changed"] = _instructions_changed_note("AGENTS.md", instructions)
     return _driver_cmd(OPENHANDS_PYTHON, OPENHANDS_DRIVER, job, env)
 
 
@@ -11753,7 +12138,10 @@ def _kimi_mcp_unavailable(state: dict) -> list[dict]:
         return []
     log = _kimi_home(pathlib.Path(cwd)) / "logs" / "kimi-code.log"
     try:
-        lines = log.read_text(errors="replace").splitlines()[-400:]
+        # As the session: the log is in its tree, and a link it planted at that name leads nowhere it could
+        # not read itself.
+        with _fs_as(_session_uid(cwd)):
+            lines = log.read_text(errors="replace").splitlines()[-400:]
     except OSError:
         return []
     since = float(state.get("started") or 0) - 2.0
@@ -12225,7 +12613,10 @@ def _opensquilla_transcript(state: dict) -> list[dict]:
         return []
     state_dir, transcript, _ = _opensquilla_paths(cwd)
     try:
-        lines = transcript.read_text(errors="replace").splitlines()
+        # As the session: the transcript is in its tree, and a link it planted at that name leads nowhere
+        # it could not read itself. This runs on the turn's thread, which is root's.
+        with _fs_as(_session_uid(cwd)):
+            lines = transcript.read_text(errors="replace").splitlines()
     except OSError:
         return []
     msgs: list[dict] = []
@@ -12583,7 +12974,7 @@ def _build_opensquilla(provider: str, auth: Auth, model: str, prompt: str, cwd: 
         # NOT a per-tool switch: `--permissions` chooses a posture (restricted / bypass / full) and
         # there is no deny list on the CLI, so the disabled set travels as a standing instruction in
         # the agent doc instead — the same honest downgrade codex, hermes, dsh and gemini get, and
-        # the reason this base's tool_enforcement is "soft" in the gateway's catalog.
+        # the reason this base's tool_enforcement is "instruction" in the gateway's catalog.
         pass
     return cmd
 
@@ -13800,9 +14191,10 @@ def _vibe_profile(home: pathlib.Path, model: str) -> None:
 
 
 def _vibe_export(cwd: str) -> dict:
-    """This turn's export.json, or {} when the run died before writing one."""
+    """This turn's export.json, or {} when the run died before writing one. Read as the session: the file
+    is in its tree, and a link it planted at that name leads nowhere it could not read itself."""
     try:
-        with open(_vibe_out(cwd) / "export.json", encoding="utf-8") as fh:
+        with _fs_as(_session_uid(cwd)), open(_vibe_out(cwd) / "export.json", encoding="utf-8") as fh:
             obj = json.load(fh)
         return obj if isinstance(obj, dict) else {}
     except (OSError, ValueError):
@@ -14433,7 +14825,8 @@ def _dcode_config(cwd: str) -> None:
 def _build_dcode(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                  resume_session_id: str | None = None, mcp_servers: list[dict] | None = None,
                  tools_disabled: list[str] | None = None,
-                 max_turns: int | None = None) -> list[str]:
+                 max_turns: int | None = None,
+                 instructions: str | None = None) -> list[str]:
     pr = provider or "openai-api"
     if pr not in DCODE_PROVIDERS:
         raise HTTPException(400, f"unknown dcode provider '{pr}' (one of {sorted(DCODE_PROVIDERS)})")
@@ -14491,6 +14884,12 @@ def _build_dcode(provider: str, auth: Auth, model: str, prompt: str, cwd: str, e
         # Nothing declared: its auto-discovery would otherwise pick up a config in the workspace,
         # which is the task's own file rather than the harness's declaration.
         cmd.append("--no-mcp")
+    known = bool(resume_session_id) and _dcode_session_present(cwd, cmd, resume_session_id)
+    if known and instructions and instructions.strip():
+        # The agent's memory middleware reads AGENTS.md into the thread's checkpointed state once, and
+        # a resumed thread keeps that copy: an edit is handed over with the message
+        # (_PINNED_INSTRUCTIONS).
+        prompt = _instructions_changed_note("AGENTS.md", instructions) + prompt
     # The driver speaks ACP to that process and claude's stream-json to the runner.
     job = {"argv": cmd, "cwd": str(pathlib.Path(cwd).resolve()),
            # The task rides the protocol, not the command line: ACP takes it in session/prompt.
@@ -14501,7 +14900,7 @@ def _build_dcode(provider: str, auth: Auth, model: str, prompt: str, cwd: str, e
            # the store DOES have (resume_known) must load, or the turn fails with the agent's own
            # reason: it is never answered as a new conversation without a word.
            "resume": resume_session_id or "",
-           "resume_known": bool(resume_session_id) and _dcode_session_present(cwd, cmd, resume_session_id),
+           "resume_known": known,
            # A cap of its own, under the runner's, so a turn that never answers is reported as the
            # limit rather than as an unexplained failure.
            "timeout": MAX_TURN_SECONDS}
@@ -14580,6 +14979,39 @@ def _fast_agent_set_model(cwd: str, session_id: str, model: str) -> bool:
             want = f"generic.{model}"
             if spec.get("model_spec") != want:
                 spec["model_spec"] = want
+                changed = True
+        if not changed:
+            return False
+        tmp = path.with_suffix(".json.hr-tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, path)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _fast_agent_forget_prompt(cwd: str, session_id: str) -> bool:
+    """Let a resumed session take its instruction from this turn's -i file, not from the store.
+
+    fast-agent saves each agent's resolved instruction with the session (`resolved_prompt`) and a
+    load puts it back over the one the agent was started with (session/hydrator.py
+    _restore_agent_prompt), so a resumed session read AGENTS.md once: measured on the 0.40.0 image,
+    a continued turn's system message was the first turn's instructions and not the edited ones. An
+    absent `resolved_prompt` is fast-agent's own "nothing to restore", and the agent then keeps the
+    instruction -i read this turn. Only that field changes, as in _fast_agent_set_model: the history
+    is a file of its own and is not touched. True when a stored prompt was let go."""
+    path = _fast_agent_session_file(cwd, session_id)
+    try:
+        with path.open(encoding="utf-8") as fh:
+            doc = json.load(fh)
+        agents = ((doc.get("continuation") or {}).get("agents") or {})
+        if not isinstance(agents, dict):
+            return False
+        changed = False
+        for spec in agents.values():
+            if isinstance(spec, dict) and spec.get("resolved_prompt") is not None:
+                spec["resolved_prompt"] = None
                 changed = True
         if not changed:
             return False
@@ -14837,7 +15269,8 @@ def _build_fast_agent(provider: str, auth: Auth, model: str, prompt: str, cwd: s
                       resume_session_id: str | None = None,
                       mcp_servers: list[dict] | None = None,
                       tools_disabled: list[str] | None = None,
-                      max_turns: int | None = None, vision: bool = True) -> list[str]:
+                      max_turns: int | None = None, vision: bool = True,
+                      instructions_changed: bool = False) -> list[str]:
     pr = provider or "openai-api"
     if pr not in FAST_AGENT_PROVIDERS:
         raise HTTPException(400, f"unknown fast-agent provider '{pr}' "
@@ -14897,6 +15330,10 @@ def _build_fast_agent(provider: str, auth: Auth, model: str, prompt: str, cwd: s
         # The store is pointed at this turn's model first: the loaded session keeps its own, and
         # neither --model nor ACP changes it (measured).
         _fast_agent_set_model(cwd, resume_session_id, model)
+        if instructions_changed:
+            # ...and the prompt it stored is let go when the instructions changed, so the agent keeps
+            # the one -i reads now (_fast_agent_forget_prompt): the file, read as any new session reads it.
+            _fast_agent_forget_prompt(cwd, resume_session_id)
         if not vision:
             # ...and an image an earlier model attached is not sent to one that refuses images.
             _fast_agent_drop_media(cwd, resume_session_id, model)
@@ -14994,6 +15431,9 @@ BACKENDS = {
     # same relationship omp has to pi.
     "mimo": {"providers": sorted(MIMO_PROVIDERS), "default_model": MIMO_DEFAULT_MODEL,
              "normalize": _opencode_to_claude},
+    # Roder runs its native app-server through a separate one-turn driver.
+    "roder": {"providers": sorted(roder_backend.PROVIDERS), "default_model": roder_backend.DEFAULT_MODEL,
+              "normalize": roder_backend.normalize},
     # jcode's NDJSON is its OWN schema (src/cli/commands.rs emit_ndjson_event), including a `tokens`
     # event the turn has to ACCUMULATE because its own `done.usage` holds only the last request's.
     "jcode": {"providers": sorted(JCODE_PROVIDERS), "default_model": JCODE_DEFAULT_MODEL,
@@ -15233,7 +15673,7 @@ def _kill_capped(proc: subprocess.Popen, rec: dict) -> None:
 # CLI's own. jcode is absent too — its counter in _jcode_to_claude predates this one and emits
 # jcode's own usage, so it stays.
 _GENERIC_STEP_BUDGET = {"codex", "dsh", "pi", "omp", "qwen", "gemini", "cline",
-                        "opencode", "mimo", "kilo", "qoder"}
+                        "opencode", "mimo", "kilo", "qoder", "roder"}
 
 
 # ── a question for the person ends the turn (UHP Tasks §3.2, #476) ──────────────────────────────
@@ -16074,6 +16514,36 @@ def _hermes_db_ro(db_path: str) -> sqlite3.Connection | None:
         return None
 
 
+def _hermes_forget_system_prompt(db_path: str, session_id: str) -> bool:
+    """Make a resumed Hermes session build its system prompt again, from the files as they are now.
+
+    Hermes keeps the system prompt it built on a session's first turn in its state.db and replays it
+    verbatim on every continuation, for the provider's prefix cache (agent/conversation_loop.py,
+    _restore_or_build_system_prompt), so it reads AGENTS.md once per conversation: an edit to the
+    harness's instructions never reached a continued task. Measured on 0.19.0 against a recording
+    stand-in: the continued turn's request carried the first turn's instructions and not the edited
+    ones. A NULL stored prompt is Hermes's own signal to rebuild, the one it sets itself when a
+    session's model changes (hermes_state.update_session_model); the conversation is in the messages
+    table and is not touched. Called on the runner's thread as the session (_fs_as), so a journal the
+    write creates is the session's. True when a stored prompt was cleared."""
+    if not os.path.isfile(db_path):
+        return False
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        try:
+            cur = db.execute("UPDATE sessions SET system_prompt = NULL WHERE id = ? AND system_prompt IS NOT NULL",
+                             (session_id,))
+            db.commit()
+            return cur.rowcount > 0
+        finally:
+            db.close()
+    except sqlite3.Error as e:
+        # The turn still runs, on the instructions the session started with; said, not hidden.
+        print(f"[hermes] the stored system prompt could not be cleared, so this turn keeps the "
+              f"instructions its session started with: {type(e).__name__}: {str(e)[:160]}", flush=True)
+        return False
+
+
 def _hermes_session_row(db_path: str, sid: str) -> dict | None:
     db = _hermes_db_ro(db_path)
     if db is None:
@@ -16143,6 +16613,10 @@ def _run_hermes_bg(turn_id: str, cwd: str, env: dict, model: str, provider: str,
     rec = _turns[turn_id]
     state: dict = {"final": ""}
     db_path = os.path.join(env["HERMES_HOME"], "state.db")
+    # The database is in the session's tree, and this thread is root's: every read of it below is made as the
+    # session (_fs_as), so a link the session planted at its name, or at its -wal beside it, leads nowhere it
+    # could not read itself. What it reads becomes this turn's events and its usage.
+    suid = _session_uid(cwd)
     t0 = time.time()
 
     def append(ev: dict) -> None:
@@ -16155,7 +16629,8 @@ def _run_hermes_bg(turn_id: str, cwd: str, env: dict, model: str, provider: str,
     resume = None
     pre = None
     if resume_session_id:
-        pre = _hermes_session_row(db_path, resume_session_id)
+        with _fs_as(suid):
+            pre = _hermes_session_row(db_path, resume_session_id)
         if pre:
             resume = resume_session_id
         else:
@@ -16213,18 +16688,23 @@ def _run_hermes_bg(turn_id: str, cwd: str, env: dict, model: str, provider: str,
     produced = False        # has the model emitted ANY message yet (see _HERMES_STARTUP_TIMEOUT_S)
     last_msg = t0           # when the last message of this turn was read from the CLI's database
     if resume:
-        db = _hermes_db_ro(db_path)
-        if db is not None:
-            try:  # only rows appended by THIS turn become events
-                cursor = db.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE session_id=?",
-                                    (resume,)).fetchone()[0]
-            except Exception:  # noqa: BLE001
-                pass
-            finally:
-                db.close()
+        with _fs_as(suid):
+            db = _hermes_db_ro(db_path)
+            if db is not None:
+                try:  # only rows appended by THIS turn become events
+                    cursor = db.execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE session_id=?",
+                                        (resume,)).fetchone()[0]
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    db.close()
         append({"type": "system", "subtype": "init", "session_id": resume, "model": model})
 
     def _sweep() -> None:
+        with _fs_as(suid):
+            _sweep_db()
+
+    def _sweep_db() -> None:
         nonlocal sid, cursor, produced, last_msg
         db = _hermes_db_ro(db_path)
         if db is None:
@@ -16283,7 +16763,8 @@ def _run_hermes_bg(turn_id: str, cwd: str, env: dict, model: str, provider: str,
     usage = {"input_tokens": 0, "output_tokens": 0}
     run_failed = False
     if sid:
-        post = _hermes_session_row(db_path, sid) or {}
+        with _fs_as(suid):
+            post = _hermes_session_row(db_path, sid) or {}
         usage = {"input_tokens": max(0, int(post.get("input_tokens") or 0) - int((pre or {}).get("input_tokens") or 0)),
                  "output_tokens": max(0, int(post.get("output_tokens") or 0) - int((pre or {}).get("output_tokens") or 0))}
     if not use_chat:
@@ -16413,10 +16894,10 @@ def _ws_marker_get(identifier: str) -> str:
 
 
 def _ws_marker_clear(identifier: str) -> None:
-    try:
-        _ws_marker_path(identifier).unlink()
-    except OSError:
-        pass
+    marker = _ws_marker_path(identifier)
+    for path in (marker, pathlib.Path(str(marker) + ".branch.json")):
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def _ws_holds(identifier: str, ws_path: pathlib.Path, sha: str) -> bool:
@@ -16438,6 +16919,132 @@ def _ws_holds(identifier: str, ws_path: pathlib.Path, sha: str) -> bool:
     return False
 
 
+def _ws_wipe(ws_path: pathlib.Path) -> None:
+    """Everything in a workspace folder removed, the folder itself kept. Warm-pool sandboxes are
+    REUSED across sessions, so the folder may hold a prior session's files (incl. another
+    tenant's); with HR_SANDBOX_PER_SESSION it is the workspace root itself (_ws), which is never
+    removed. /hydrate and a branch's restore both start from this."""
+    for child in ws_path.iterdir():
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _hydrate_branch(request: Request, identifier: str) -> dict:
+    """A new session from committed user files; never import another session's CLI home.
+
+    Only this handler answers `branched: true`, and the gateway takes nothing else for a branch: a
+    runner from before branching ignores `branch_commit`, restores the source's latest workspace
+    whole and answers 200, which would be a branch with the wrong files.
+
+    The target is wiped first, as /hydrate wipes it, unless it is this branch's own restore
+    already (its receipt). A pooled sandbox reused across sessions, or the workspace root itself
+    under HR_SANDBOX_PER_SESSION, holds whatever the last session left there, and refusing it
+    refused every branch on such a sandbox. A failure empties the target again and removes it only
+    where it is a per-session folder: the workspace root is never removed."""
+    from branching import BranchRestoreFailed, BranchUnavailable, restore
+
+    selected = request.query_params.get("branch_commit", "")
+    latest = request.query_params.get("branch_head", "")
+    if request.query_params.get("probe"):
+        raise HTTPException(409, "branch_unavailable")
+    fd, spool_path = tempfile.mkstemp(suffix=".tgz", dir=SPOOL_DIR)
+    target = None
+    touched = complete = False
+    nbytes = 0
+    try:
+        try:
+            with os.fdopen(fd, "wb") as output:
+                async for chunk in request.stream():
+                    output.write(chunk)
+                    nbytes += len(chunk)
+        except Exception as error:
+            raise HTTPException(400, "branch body incomplete") from error
+        if not nbytes:
+            raise HTTPException(409, "branch_unavailable")
+        ws = _ws(identifier)
+        target = pathlib.Path(ws)
+        receipt = pathlib.Path(str(_ws_marker_path(identifier)) + ".branch.json")
+        if target.exists() and any(target.iterdir()):
+            try:
+                previous = json.loads(receipt.read_text())
+            except (OSError, ValueError):
+                previous = None
+            if previous is not None:
+                # This folder is this branch's: the same restore again (a resend after a lost
+                # answer) is done already. Anything else means the session has moved on since (a
+                # checkpoint advanced its marker), and a late resend must not wipe its work.
+                try:
+                    if (previous["commit"] == selected and previous["head"] == latest
+                            and _ws_holds(identifier, target, previous["sha"])):
+                        return {"ok": True, "restored": True, "branched": True}
+                except (KeyError, TypeError):
+                    pass
+                raise HTTPException(409, "branch_unavailable")
+        # A truncated upload never gets here. From here a failure empties the target again.
+        touched = True
+        _ws_marker_clear(identifier)          # first, as /hydrate: nothing vouches for a half restore
+        target.mkdir(parents=True, exist_ok=True)
+        _ws_wipe(target)
+        _isolate_session(ws)
+        # Off the event loop: the restore runs Git and reads and writes whole archives, minutes
+        # for a large one, and every other session on this runner waited behind it. _fs_as is per
+        # thread (setfsuid) and is entered and left inside restore(), on the worker thread that
+        # writes, so the write wall holds there and no other thread's identity changes.
+        work = asyncio.ensure_future(asyncio.to_thread(
+            restore, pathlib.Path(spool_path), target, selected, latest, pathlib.Path(SPOOL_DIR),
+            write_context=lambda: _fs_as(_session_uid(ws)),
+            excluded=(*CHECKPOINT_EXCLUDE, *("./" + p for p in (*_PER_TURN_CONFIG, *_STATE_DIRS)))))
+        try:
+            branch_sha = await asyncio.shield(work)
+        except asyncio.CancelledError:
+            # A thread can't be stopped: the cleanup below waits for it, or it would write into
+            # a folder already emptied.
+            await asyncio.wait([work])
+            raise
+        _git_ensure(ws)
+        if request.query_params.get("branch_backend") == "nanobot":
+            with _fs_as(_session_uid(ws)):
+                # Regenerate public file-root metadata; never import the source's .harness state.
+                _agent_subdir_set(ws, _NANOBOT_WS)
+                _git_exclude(ws, [f"{_NANOBOT_WS}/.nanobot/", f"{_NANOBOT_WS}/skills/",
+                                  f"{_NANOBOT_WS}/memory/", f"{_NANOBOT_WS}/AGENTS.md"],
+                             "nanobot's own machinery, never the task's output")
+        _ws_marker_set(identifier, branch_sha)
+        if _ws_marker_get(identifier) != branch_sha:
+            raise OSError("branch marker could not be saved")
+        receipt_fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(receipt_fd, "w") as output:
+            json.dump({"commit": selected, "head": latest, "sha": branch_sha}, output)
+        complete = True
+        return {"ok": True, "restored": True, "branched": True}
+    except BranchUnavailable as error:
+        raise HTTPException(409, "branch_unavailable") from error
+    except BranchRestoreFailed as error:
+        # Not 503, which the gateway resends (_HYDRATE_PAUSES, seven times): a restore that ran
+        # out of time or disk does the same again, after the whole upload again.
+        raise HTTPException(500, "branch_restore_failed") from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(503, "branch restore temporarily unavailable") from error
+    finally:
+        if touched and not complete:
+            _ws_marker_clear(identifier)       # the marker and the receipt
+            with contextlib.suppress(OSError):
+                _ws_wipe(target)
+            if not _SANDBOX_PER_SESSION and os.path.realpath(target) not in (
+                    os.path.realpath(WORKSPACE_ROOT), "/"):
+                with contextlib.suppress(OSError):
+                    target.rmdir()
+        with contextlib.suppress(OSError):
+            os.unlink(spool_path)
+
+
 @app.post("/hydrate")
 async def hydrate(request: Request, identifier: str = "") -> dict:
     """Restore /workspace from a checkpoint tarball (the request body). Empty body = a fresh
@@ -16448,6 +17055,8 @@ async def hydrate(request: Request, identifier: str = "") -> dict:
     materializes in the sandbox's ~2 GiB RAM. sha256 folds over the incoming stream; untar reads
     from the spooled file. CRITICALLY, the spool completes BEFORE the workspace wipe — a truncated
     upload (client disconnect) raises during spooling and leaves the current workspace untouched."""
+    if "branch_commit" in request.query_params:
+        return await _hydrate_branch(request, identifier)
     _reap_workspaces(keep=_SID_SAFE.sub("_", (identifier or "").strip())[:120] or "_default")
     ws = _ws(identifier)
     ws_path = pathlib.Path(ws)
@@ -16491,14 +17100,7 @@ async def hydrate(request: Request, identifier: str = "") -> dict:
         # The marker goes first: a restart in the middle of the wipe or the untar must not leave it
         # vouching for a half-restored folder, now that it outlives a restart.
         _ws_marker_clear(identifier)
-        for child in ws_path.iterdir():
-            try:
-                if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink()
-            except Exception:  # noqa: BLE001
-                pass
+        _ws_wipe(ws_path)
         restored = False
         if nbytes:
             with open(spool_path, "rb") as tar_in:
@@ -16526,19 +17128,37 @@ async def hydrate(request: Request, identifier: str = "") -> dict:
 
 
 @app.get("/checkpoint")
-def checkpoint(background_tasks: BackgroundTasks, identifier: str = "") -> Response:
+def checkpoint(background_tasks: BackgroundTasks, identifier: str = "", commit: str = "1") -> Response:
     """Commit /workspace and return it as a gzip tarball (secrets/scratch excluded). The gateway
     persists this to durable blob storage; the next turn's /hydrate restores it on any sandbox.
 
     Spools the tar to LOCAL DISK instead of a RAM buffer (HR-INF-015): a big (GB) workspace no
     longer materializes the whole tarball in the sandbox's ~2 GiB RAM alongside the CLI. tar writes
     straight to a temp file; sha256 is folded over a chunked read of that file; FileResponse then
-    streams it to the gateway. The temp file is removed after the response is sent."""
+    streams it to the gateway. The temp file is removed after the response is sent.
+
+    `commit=0` is a checkpoint taken while the turn runs (the gateway's _step_checkpoint, #505):
+    the tarball only. A commit there would stage and commit the agent's work under its feet, so its
+    own `git status` and `git diff` go quiet halfway through, and `git add` can meet the agent's own
+    git on .git/index.lock. The uncommitted state travels as it is and is restored as it was."""
     _reap_spool()   # clear any spool file leaked by a prior mid-stream disconnect
     ws = _ws(identifier)
     _git_ensure(ws)
-    _git(ws, "add", "-A")
-    _git(ws, "commit", "-q", "-m", f"checkpoint {int(time.time())}", "--allow-empty")
+    if commit != "0":
+        _git(ws, "add", "-A")
+        _git(ws, "commit", "-q", "-m", f"checkpoint {int(time.time())}", "--allow-empty")
+    # Both identities are read before archiving; Git metadata that can't be read must not lose the
+    # workspace. The full commit is the turn's branch point (the gateway's _branch_point_put), so it
+    # is sent only for a checkpoint that committed: a mid-turn tarball is not the HEAD commit's tree.
+    head = full_commit = ""
+    try:
+        if commit != "0":
+            full_commit = _git(ws, "rev-parse", "HEAD").stdout.strip()
+            if not re.fullmatch(r"[0-9a-f]{40}", full_commit):
+                full_commit = ""
+        head = _git(ws, "rev-parse", "--short", "HEAD").stdout.strip()
+    except Exception:
+        head = full_commit = ""
     excl = [f"--exclude={p}" for p in CHECKPOINT_EXCLUDE]
     fd, tar_path = tempfile.mkstemp(suffix=".tgz", dir=SPOOL_DIR)   # OUTSIDE the workspace
     try:
@@ -16554,11 +17174,11 @@ def checkpoint(background_tasks: BackgroundTasks, identifier: str = "") -> Respo
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
                 nbytes += len(chunk)
-        head = _git(ws, "rev-parse", "--short", "HEAD").stdout.strip()
         _ws_marker_set(identifier, h.hexdigest())   # this session now HOLDS this checkpoint
         background_tasks.add_task(os.unlink, tar_path)   # cleanup after the response streams out
         return FileResponse(tar_path, media_type="application/gzip", background=background_tasks,
-                            headers={"X-Checkpoint-Bytes": str(nbytes), "X-Git-Head": head})
+                            headers={"X-Checkpoint-Bytes": str(nbytes), "X-Git-Head": head,
+                                     "X-Git-Commit": full_commit})
     except HTTPException:
         raise
     except Exception:
@@ -17070,6 +17690,52 @@ def capabilities(identifier: str = "") -> dict:
     }
 
 
+# Disabled tools, by what each CLI can actually enforce. Where the CLI has a real switch, its builder
+# uses it and the tool is not in what the model is offered: claude's `permissions.deny` in
+# settings.json (_build_claude; NOT `--disallowedTools`, which belongs to the permission-prompt system
+# that --dangerously-skip-permissions turns off), pi's and omp's tool lists, opencode's and kilo's
+# `permission` denies, goose's available_tools, and the rest named in the gateway's _BASE_CATALOG with
+# `tool_enforcement: "hard"`. A permission-prompt switch that the turn's own skip-approval mode turns
+# off is not a block, and none of these is one.
+#
+# The bases in this set have no switch that withholds every tool the catalog offers, so the disabled
+# set reaches the model as a standing instruction in the agent doc instead (_disabled_tools_note).
+# That is a request, not a guarantee: verified reaching the agent, and verified as a request (hermes
+# complied, codex used the tool anyway), which is why the console says so next to the switch. UHP §4.3
+# requires the request rather than silence wherever a block is not possible: an operator who switched
+# a tool off and got neither believes it is off. Qwen Code and Cline were in neither group, and an
+# operator who switched every tool off on them watched the agent use them all.
+#   codex       — web_search and the shell have switches (_codex_web_search_off, _codex_shell_off);
+#                 the catalog's other names are not tools codex 0.154 offers, so they are asked.
+#   hermes      — switches toolsets, not tools. A toolset whose every tool is off is switched off,
+#                 so those tools are withheld (_hermes_toolsets_off: terminal, the four file tools
+#                 together, the web tools); read_file alone, say, is asked.
+#   dsh         — switches its profile's rows. A row that registers only a disabled tool (bash,
+#                 str_replace_editor, todo_write, skill, subagent, subagent_fork, workflow; web_fetch
+#                 has its row's own switch) is off, so that tool is withheld (dsh_driver._rows_off);
+#                 read, write and edit share a row with read_image, and glob and grep share one, so
+#                 those are asked unless their whole row is off.
+#   opensquilla — `--permissions` picks a posture (restricted / bypass / full); there is no
+#                 per-tool deny list anywhere on its agent CLI.
+# Qwen Code, Gemini CLI and Cline have one each in a settings file (_qwen_settings, _gemini_settings,
+# _cline_settings).
+# The gateway's catalog says the same thing per base (tool_enforcement "instruction" for exactly
+# these), and gateway/tests/test_tool_enforcement_parity.py holds the two together.
+_TOOLS_OFF_BY_REQUEST = frozenset({"codex", "hermes", "dsh", "opensquilla"})
+
+
+def _disabled_tools_note(backend: str, tools_disabled: list[str] | None) -> str:
+    """The agent doc's "Disabled tools" section for a base that can only be asked not to use a tool,
+    or "" where there is nothing to ask (a base with a real switch, or no tool switched off). The
+    names are the harness's own, as stored."""
+    if backend not in _TOOLS_OFF_BY_REQUEST:
+        return ""
+    names = ", ".join(t for t in (tools_disabled or []) if t and str(t).strip())
+    if not names:
+        return ""
+    return f"## Disabled tools\n\nDo NOT use these tools — they are disabled for this harness: {names}."
+
+
 class TurnReq(BaseModel):
     backend: str = "claude"          # claude | codex | hermes | pi | dsh
     provider: str | None = None      # see BACKENDS[...].providers
@@ -17196,6 +17862,11 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
         # becomes a launcher every backend writer below already knows how to hand to its CLI.
         plugin_roots = _write_plugins(cwd, req.plugins)
         servers = req.mcp_servers if req.backend in _MCP_AGENT_RUNS_ELSEWHERE else _mcp_through_relay(req.mcp_servers)
+        # whether the platform's memory is attached, from the address the gateway sent (only its path is read): the
+        # base's own memory tools are then withheld (_own_memory_off; hermes in its config, below)
+        platform_memory = _has_platform_memory(req.mcp_servers)
+        if platform_memory:
+            req.tools_disabled = _own_memory_off(backend, req.tools_disabled)
         req.mcp_servers = _sse_bridges(cwd, _plugin_launchers(cwd, servers), req.backend)
         # A package that is also a Claude Code plugin reaches the claude CLI whole through
         # --plugin-dir, which loads its skills/ itself; folding those skills into the skills
@@ -17209,31 +17880,11 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
         # Seed the agent's instruction file (AGENTS.md/CLAUDE.md) from the harness doc + installed skills.
         # The model's system prompt stays the CLI default; persistent instructions live in this file.
         #
-        # Disabled tools, by what each CLI can actually enforce:
-        #   claude — a `permissions.deny` list in settings.json, a hard block (see _build_claude). The
-        #     agent reports having no such tool. NOT `--disallowedTools`: that belongs to the permission
-        #     prompt system, which --dangerously-skip-permissions turns off.
-        #   codex, hermes — no per-tool switch exists. Codex has none at all; hermes only disables whole
-        #     TOOLSETS, which is a different granularity from the per-tool names a harness configures.
-        #     Both read the agent doc, so both get the same instruction. It is a request to the model,
-        #     not a guarantee — verified reaching the agent on both, and verified as a request: hermes
-        #     complied, codex used the tool anyway. That is why the console calls it a request rather
-        #     than a block. Written here once rather than as two divergent branches — hermes previously
-        #     had neither, and silently ignored every disabled tool.
-        #   gemini — same tier, no confirmed per-tool switch in headless mode (see _BASE_CATALOG's
-        #     "gemini" entry). UHP §4.3 requires this be conveyed as a standing instruction rather than
-        #     silently dropped wherever it can't be a hard block, so it goes in this set rather than
-        #     being left out of it — the same class of gap this comment already names for hermes.
     agent_doc = req.agent_doc or ""
-    # opensquilla is in this set for the same reason gemini is: `--permissions` picks a posture
-    # (restricted / bypass / full) and there is no per-tool deny list anywhere on its agent CLI, so
-    # UHP §4.3 requires the disabled set be conveyed as a standing instruction rather than silently
-    # dropped. nanobot, mimo and jcode are NOT here — each has a real switch.
-    if backend in ("codex", "hermes", "dsh", "gemini", "opensquilla") and req.tools_disabled:
-        _off = ", ".join(t for t in req.tools_disabled if t)
-        if _off:
-            agent_doc = ((agent_doc + "\n\n") if agent_doc.strip() else "") + \
-                f"## Disabled tools\n\nDo NOT use these tools — they are disabled for this harness: {_off}."
+    # A disabled tool the CLI cannot withhold is asked off in the agent doc (_TOOLS_OFF_BY_REQUEST).
+    _off = _disabled_tools_note(backend, req.tools_disabled)
+    if _off:
+        agent_doc = ((agent_doc + "\n\n") if agent_doc.strip() else "") + _off
     note = _codex_custom_editing_note(backend, req.auth)
     if note:
         agent_doc = ((agent_doc + "\n\n") if agent_doc.strip() else "") + note
@@ -17242,7 +17893,22 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
         # The layer is mounted read-only in THIS sandbox; a remote runtime sees only what its driver
         # uploads. Said here, before anything starts, rather than run without it.
         raise HTTPException(400, f"the {backend} backend runs in a remote runtime and cannot mount an environment")
-    _write_agent_doc(cwd, backend, agent_doc, installed_skills, environment=turn_environment)
+    doc_body = _compose_agent_doc(cwd, backend, agent_doc, installed_skills, environment=turn_environment)
+    doc_changed = _write_agent_doc(cwd, backend, agent_doc, installed_skills, environment=turn_environment,
+                                   body=doc_body)
+    # The instructions, for a base that keeps its first copy, when there is a conversation to continue
+    # and they changed since its last turn; each builder adds them only when it resumes. THE TEXT THE
+    # RUNNER COMPOSED, never the file read back: the note says it replaces the instructions, and the
+    # workspace is the agent's to write, so a process it left running could rewrite the file between
+    # the write above and any read. Hermes and fast-agent are not handed text: they rebuild from the
+    # file on disk, the same trust as any new session reading its instruction file.
+    changed_doc = (doc_body or None) if (
+        doc_changed and req.resume_session_id and backend in _PINNED_INSTRUCTIONS) else None
+    if changed_doc and len(changed_doc.encode()) > _NOTE_INLINE_MAX:
+        print(f"[instructions] {backend} session {identifier}: the edited instructions ({len(changed_doc.encode())} "
+              f"bytes) are too large to hand to a continued turn, so this task keeps the instructions it started "
+              f"with; a new task uses the edit", flush=True)
+        changed_doc = None
     # The harness's own variables under the runner's, so nothing a caller names shadows the
     # runner's credentials or paths; the platform's HR_ names come after and win (below).
     env = {**_caller_env(req.env), **_child_env()}
@@ -17324,21 +17990,28 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
             mcp_toml = _codex_mcp_toml(req.mcp_servers)
             if use_appserver:
                 _codex_prepare_env(req.provider, auth, model, cwd, env, mcp_toml, resume=bool(req.resume_session_id),
-                                   tools_disabled=req.tools_disabled)   # config.toml + CODEX_HOME + auth
+                                   tools_disabled=req.tools_disabled,
+                                   own_memory_off=platform_memory)   # config.toml + CODEX_HOME + auth
             else:
                 cmd, codex_note = _build_codex(req.provider, auth, model, req.prompt, cwd, env,
-                                               mcp_toml=mcp_toml, resume_session_id=req.resume_session_id, tools_disabled=req.tools_disabled)
+                                               mcp_toml=mcp_toml, resume_session_id=req.resume_session_id, tools_disabled=req.tools_disabled,
+                                               own_memory_off=platform_memory)
         elif backend == "hermes":
             model = model or HERMES_DEFAULT_MODEL
             hermes_provider = _hermes_resolve_provider(req.provider, auth)
             hermes_mcp = _hermes_prepare_env(hermes_provider, auth, cwd, env, model=model,
                                              max_turns=req.max_turns, mcp_servers=req.mcp_servers,
-                                             vision_auth=req.vision_auth)
+                                             vision_auth=req.vision_auth, own_memory_off=platform_memory,
+                                             tools_disabled=req.tools_disabled)
+            if req.resume_session_id and doc_changed:
+                # Hermes then builds the prompt from AGENTS.md as it reads it, the trust of any new
+                # session reading its instruction file; no text of the runner's is said to replace it.
+                _hermes_forget_system_prompt(os.path.join(env["HERMES_HOME"], "state.db"), req.resume_session_id)
         elif backend == "dsh":
             model = model or DSH_DEFAULT_MODEL
             cmd = _build_dsh(req.provider, auth, model, req.prompt, cwd, env,
                              resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
-                             vision=bool(req.vision))
+                             vision=bool(req.vision), tools_disabled=req.tools_disabled)
         elif backend == "pi":
             model = model or PI_DEFAULT_MODEL
             cmd = _build_pi(req.provider, auth, model, req.prompt, cwd, env,
@@ -17352,7 +18025,8 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
         elif backend == "qwen":
             model = model or QWEN_DEFAULT_MODEL
             cmd = _build_qwen(req.provider, auth, model, req.prompt, cwd, env,
-                              resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers)
+                              resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
+                              tools_disabled=req.tools_disabled, own_memory_off=platform_memory)
         elif backend == "kimi":
             model = model or KIMI_DEFAULT_MODEL
             # _write_skills has already run, so the directory is on disk and can simply be named:
@@ -17362,7 +18036,7 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
             cmd = _build_kimi(req.provider, auth, model, req.prompt, cwd, env,
                               resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
                               skills_dir=kimi_skills, tools_disabled=req.tools_disabled,
-                              max_turns=req.max_turns)
+                              max_turns=req.max_turns, instructions=changed_doc)
         elif backend == "minimax":
             model = model or MINIMAX_DEFAULT_MODEL
             # Skills are already on disk in the home _write_skills chose, which the CLI discovers itself;
@@ -17377,7 +18051,7 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
             cmd = _build_grok(req.provider, auth, model, req.prompt, cwd, env,
                               resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
                               tools_disabled=req.tools_disabled, max_turns=req.max_turns,
-                              partial=bool(req.partial_messages))
+                              partial=bool(req.partial_messages), instructions=changed_doc)
         elif backend == "aider":
             model = model or AIDER_DEFAULT_MODEL
             # aider has no skill loader and no instruction-file convention: the driver puts the agent
@@ -17413,7 +18087,8 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
             cmd = _build_openhands(req.provider, auth, model, req.prompt, cwd, env,
                                    resume_session_id=req.resume_session_id,
                                    mcp_servers=req.mcp_servers,
-                                   tools_disabled=req.tools_disabled, max_turns=req.max_turns)
+                                   tools_disabled=req.tools_disabled, max_turns=req.max_turns,
+                                   instructions=changed_doc)
         elif backend == "agentzero":
             model = model or AGENTZERO_DEFAULT_MODEL
             cmd = _build_agentzero(req.provider, auth, model, req.prompt, cwd, env,
@@ -17442,11 +18117,13 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
             model = model or GEMINI_DEFAULT_MODEL
             cmd = _build_gemini(req.provider, auth, model, req.prompt, cwd, env,
                                 resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
-                                native_model=req.native_model)
+                                native_model=req.native_model, tools_disabled=req.tools_disabled,
+                                own_memory_off=platform_memory)
         elif backend == "cline":
             model = model or CLINE_DEFAULT_MODEL
             cmd = _build_cline(req.provider, auth, model, req.prompt, cwd, env,
-                               resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers)
+                               resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
+                               tools_disabled=req.tools_disabled)
         elif backend == "goose":
             model = model or GOOSE_DEFAULT_MODEL
             cmd = _build_goose(req.provider, auth, model, req.prompt, cwd, env,
@@ -17473,7 +18150,16 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
             skills_dir = os.path.join(cwd, ".harness", "skills") if installed_skills else None
             cmd = _build_mimo(req.provider, auth, model, req.prompt, cwd, env,
                               resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
-                              skills_dir=skills_dir, tools_disabled=req.tools_disabled)
+                              skills_dir=skills_dir, tools_disabled=req.tools_disabled,
+                              instructions=changed_doc)
+        elif backend == "roder":
+            model = model or roder_backend.DEFAULT_MODEL
+            cmd = roder_backend.build(req.provider, auth, model, req.prompt, cwd, env,
+                                      relay=_hermes_relay_route, driver_cmd=_driver_cmd,
+                                      resume_session_id=req.resume_session_id,
+                                      mcp_servers=[{**s, "auth": None, "headers": _mcp_headers(s)}
+                                                   for s in (req.mcp_servers or [])],
+                                      tools_disabled=req.tools_disabled, thinking=_TURN_THINKING.get())
         elif backend == "jcode":
             model = model or JCODE_DEFAULT_MODEL
             cmd = _build_jcode(req.provider, auth, model, req.prompt, cwd, env,
@@ -17491,12 +18177,13 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
                                     resume_session_id=req.resume_session_id,
                                     mcp_servers=req.mcp_servers,
                                     tools_disabled=req.tools_disabled, max_turns=req.max_turns,
-                                    vision=bool(req.vision))
+                                    vision=bool(req.vision), instructions_changed=doc_changed)
         elif backend == "dcode":
             model = model or DCODE_DEFAULT_MODEL
             cmd = _build_dcode(req.provider, auth, model, req.prompt, cwd, env,
                                resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
-                               tools_disabled=req.tools_disabled, max_turns=req.max_turns)
+                               tools_disabled=req.tools_disabled, max_turns=req.max_turns,
+                               instructions=changed_doc)
         elif backend == "docker-agent":
             model = model or DOCKER_AGENT_DEFAULT_MODEL
             cmd = _build_docker_agent(req.provider, auth, model, req.prompt, cwd, env,
@@ -17542,7 +18229,7 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
             cmd = _build_claude(req.provider, auth, model, req.prompt, req.max_turns, cwd, env,
                                 resume_session_id=req.resume_session_id, mcp_config=mcp_config,
                                 disallowed_tools=claude_tools_off, partial=bool(req.partial_messages),
-                                plugin_dirs=plugin_dirs)
+                                plugin_dirs=plugin_dirs, own_memory_off=platform_memory)
     resume_lost = _resume_lost(backend, cmd, req.resume_session_id, cwd)
     _isolate_session(cwd)   # everything the runner just wrote into the session is the session's now
     turn_id = "turn" + uuid.uuid4().hex
