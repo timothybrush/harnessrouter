@@ -1,8 +1,8 @@
 'use client';
-// A setup's own memory, as the service chose it for the agent (the memories spec, A1 and C1): one line, "Memory:
-// <Engine>, <why>", and Change, which offers the four engines and None. Drawn on a new setup's save card and in its
-// Settings, from the setup's record, so what is drawn is what was saved. A service before 0.40 says nothing of an
-// agent's memory, and then nothing is drawn.
+// A setup's own memory, as the service chose it for the agent (the memories spec, A1 and C1): on a new setup's save card
+// one line, "Memory: <Engine>, <why>", and Change, which offers the four engines and None in a small menu. Drawn from
+// the setup's record, so what is drawn is what was saved. A service before 0.40 says nothing of an agent's memory, and
+// then nothing is drawn.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getAgentMemory, getHarnessMemories, setAgentMemory, type AgentMemoryRead, type MemoryChoice } from '@/lib/memories';
 import { announceHarnessMemories } from '../setup/harnessMemories';
