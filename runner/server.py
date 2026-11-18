@@ -4816,10 +4816,31 @@ def _mcp_same_server(base: str, url: str) -> bool:
     return a.scheme == "http" and b.scheme == "https"
 
 
-def _mcp_through_relay(servers: list[dict] | None) -> list[dict]:
+# OpenHands freezes its agent, MCP addresses included, when the conversation is first created, and no
+# endpoint updates it (openhands_driver._conversation_id). So the relay address turn 1 gave it is the one
+# every later turn calls, and a token minted per turn was forgotten by then: every follow-up failed with the
+# relay's 401 (#714). These bases get a token that is the same for the session and the server on every
+# turn. Each turn registers it again and forgets it when it ends, as every route is forgotten, so between
+# turns it opens nothing; and it is keyed on the runner's internal key, so no other session can make it.
+_MCP_STABLE_FOR = frozenset({"openhands"})
+_MCP_STABLE_FALLBACK = uuid.uuid4().hex + uuid.uuid4().hex    # a runner with no internal key: stable per process
+
+
+def _mcp_session_token(session: tuple[str, str], name: str, url: str) -> str:
+    """The relay token of one MCP server in one session, the same on every turn of that session.
+    `session` is the gateway's session id AND the session's folder: under HR_SANDBOX_PER_SESSION every
+    session's folder is the workspace root, so the folder alone would give two sessions one token, and
+    a process left in a reused sandbox could call the relay during the next session's turn."""
+    key = (_INTERNAL_KEY or _MCP_STABLE_FALLBACK).encode()
+    msg = "\0".join(("hr-mcp-relay", session[0], session[1], name, url)).encode()
+    return "hr-mcp-" + hmac.new(key, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def _mcp_through_relay(servers: list[dict] | None, stable_for: tuple[str, str] | None = None) -> list[dict]:
     """Every remote server, as the session will see it: a relay address and no credential. Runs before
     any writer or bridge reads the list, so all of them get this without knowing about it. A stdio
-    server runs as the session and is left as it is."""
+    server runs as the session and is left as it is. With `stable_for` (the session, for a base in
+    _MCP_STABLE_FOR) the address is the same on every turn of that session (_mcp_session_token)."""
     out: list[dict] = []
     for s in servers or []:
         s = s or {}
@@ -4836,7 +4857,8 @@ def _mcp_through_relay(servers: list[dict] | None) -> list[dict]:
                 srv = _QuietHTTPServer(("127.0.0.1", 0), _McpRelayHandler)
                 threading.Thread(target=srv.serve_forever, daemon=True).start()
                 _MCP_RELAY["server"], _MCP_RELAY["port"] = srv, srv.server_address[1]
-            tok = "hr-mcp-" + uuid.uuid4().hex
+            tok = (_mcp_session_token(stable_for, str(s.get("name") or ""), url) if stable_for
+                   else "hr-mcp-" + uuid.uuid4().hex)
             _MCP_RELAY["routes"][tok] = {"url": url, "headers": _mcp_headers(s), "endpoints": {}}
             port = _MCP_RELAY["port"]
         sse = str(s.get("transport") or "").lower() == "sse" or parts.path.rstrip("/").endswith("/sse")
@@ -17471,6 +17493,18 @@ def _ws_marker_clear(identifier: str) -> None:
             path.unlink()
 
 
+_WS_PROBE_FRESH = "fresh"
+
+
+def _ws_fresh_identifier(identifier: str) -> bool:
+    """Whether `fresh` may be answered for this identifier at all. The sha probe also needs the
+    session's own checkpoint sha; `fresh` claims a folder on the marker's name alone, so it holds only
+    while one identifier is one marker and one folder: not empty, not the `_default` they fall back to,
+    and not one that sanitising (_SID_SAFE, the 120-character cut) would fold onto another session's."""
+    raw = identifier or ""
+    return bool(raw) and raw != "_default" and _SID_SAFE.sub("_", raw.strip())[:120] == raw
+
+
 def _ws_holds(identifier: str, ws_path: pathlib.Path, sha: str) -> bool:
     """Whether this session's workspace still holds checkpoint `sha`: the marker says so AND the
     folder is there to back it. The marker lives outside the workspace on purpose (it has to
@@ -17481,8 +17515,14 @@ def _ws_holds(identifier: str, ws_path: pathlib.Path, sha: str) -> bool:
     no session to resume and the conversation started over (#194). A workspace
     restored from a checkpoint always carries its .git (the tarball does, and _git_ensure runs
     after every restore), so a folder without one holds nothing, whatever the marker says; the
-    marker that vouched for it is dropped so the full hydrate that follows starts clean."""
-    if _ws_marker_get(identifier) != sha:
+    marker that vouched for it is dropped so the full hydrate that follows starts clean.
+
+    `sha` empty is the fresh start (probe `fresh`, #712): a workspace this runner started empty and
+    no checkpoint has replaced since. Only a marker FILE that says so counts; no marker is no claim.
+    A session whose first turn was cut before any checkpoint had its folder wiped by the follow-up's
+    restore from nothing: its files and the CLI's conversation both, though the cut turn's error said
+    the workspace was kept."""
+    if not _ws_marker_path(identifier).is_file() or _ws_marker_get(identifier) != sha:
         return False
     if (ws_path / ".git").is_dir():
         return True
@@ -17655,7 +17695,11 @@ async def hydrate(request: Request, identifier: str = "") -> dict:
         # answers yes — making follow-up turns start instantly instead of paying wipe + untar.
         probe = request.query_params.get("probe", "")
         if probe and nbytes == 0:
-            if _ws_holds(identifier, ws_path, probe):
+            # `fresh` asks about a session that never saved a checkpoint: does this runner still hold
+            # the workspace it started empty for it (#712)? A sha is hex, so the word is never one.
+            held = (_ws_fresh_identifier(identifier) and _ws_holds(identifier, ws_path, "")
+                    if probe == _WS_PROBE_FRESH else _ws_holds(identifier, ws_path, probe))
+            if held:
                 return {"ok": True, "skipped": True, "restored": False}
             return {"ok": True, "skipped": False}
         # Warm-pool sandboxes are REUSED across sessions, so /workspace may hold a PRIOR session's
@@ -18448,7 +18492,10 @@ def _start_turn(req: TurnReq, identifier: str = "") -> dict:
         # Installed plugin packages, whole, at their roots; then every stdio server a plugin declares
         # becomes a launcher every backend writer below already knows how to hand to its CLI.
         plugin_roots = _write_plugins(cwd, req.plugins)
-        servers = req.mcp_servers if req.backend in _MCP_AGENT_RUNS_ELSEWHERE else _mcp_through_relay(req.mcp_servers)
+        servers = (req.mcp_servers if req.backend in _MCP_AGENT_RUNS_ELSEWHERE else
+                   _mcp_through_relay(req.mcp_servers,
+                                      stable_for=((identifier or "", os.path.realpath(cwd))
+                                                  if backend in _MCP_STABLE_FOR else None)))
         # whether the platform's memory is attached, from the address the gateway sent (only its path is read): the
         # base's own memory tools are then withheld (_own_memory_off; hermes in its config, below)
         platform_memory = _has_platform_memory(req.mcp_servers)
