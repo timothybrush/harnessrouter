@@ -5229,20 +5229,90 @@ def _with_provider_base(conn: dict | None) -> dict | None:
 
 
 _PROVIDER_REFUSAL_RE = re.compile(r"\b(401|403|429)\b|unauthori[sz]ed|incorrect api key|invalid_api_key|invalid api key|"
-                                  r"insufficient_quota|rate limit|quota|forbidden", re.IGNORECASE)
+                                  r"insufficient_quota|rate[ _-]?limit|quota|forbidden", re.IGNORECASE)
+# ("too many requests" alone is not on it: Entra's own throttling answers a 502 with "AADSTS90055: Too many
+# requests.", which is the sign-in failing, not the provider turning the key down, and moves on as before.)
+# Of the provider's answers that match above, three are not the key being refused, and saying they were sends people
+# to check a key that works: an account with no quota or credit left, a rate limit (it passes if the person waits),
+# and the provider taking the key and refusing this model for it (the same key works on another model). The word
+# "quota" alone does not tell the first two apart: OpenAI's empty account is a 429 insufficient_quota, while Gemini's
+# per-minute limit is a 429 RESOURCE_EXHAUSTED that says "You exceeded your current quota ... Please retry in 41s"
+# and passes in 41 seconds. So the signals are read strongest first (_provider_failure_kind).
+_PROVIDER_NO_CREDIT_RE = re.compile(r"insufficient_(?:\w+_)?quota|out of credits?|credit balance is too low|"
+                                    r"insufficient (?:credits?|balance|funds)", re.I)
+_PROVIDER_PLAN_QUOTA_RE = re.compile(r"exceeded your (?:current )?quota|check your plan and billing", re.I)
+_PROVIDER_NO_QUOTA_RE = re.compile(r"\bquota\b", re.I)
+_PROVIDER_RATE_LIMIT_RE = re.compile(r"\b429\b|rate[ _-]?limit|too many requests|throttl|resource[ _]exhausted", re.I)
+_PROVIDER_MODEL_REFUSED_RE = re.compile(r"model_not_found|model_not_allowed|model_access_denied|"
+                                        r"(?:no|not have|lacks?) access to (?:the )?model|"
+                                        r"not (?:allowed|permitted|authori[sz]ed|entitled) to (?:use|access) (?:this |the )?model|"
+                                        r"model\W{0,3}[\w./:-]{0,80}\W{0,3}(?:is not available|not available to|is not allowed|"
+                                        r"not enabled|access denied|permission denied|does not exist or you do not have access)", re.I)
+# "retry after 20s", "Retry-After: 20", "try again in 1.5s", "please retry in 20 seconds", "try again in 120ms"
+_PROVIDER_RETRY_AFTER_RE = re.compile(r"(?:retry[ _-]?after|(?:try again|retry) in)\W{0,3}(\d+(?:\.\d+)?)\s*"
+                                      r"(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?)?\b", re.I)
+# What each one is called in a failed response's error.detail.reason, and whether running the task again can succeed.
+_PROVIDER_FAILURE_REASONS = {"refused": ("provider_key_refused", False), "model": ("provider_model_refused", False),
+                             "quota": ("provider_quota_exhausted", False), "rate_limit": ("provider_rate_limited", True)}
 
 
-def _provider_refused(err: str) -> bool:
-    """Whether a failure on the org's own connection is the provider refusing the key. Judged on
-    the first line only: that is the line the runner chose as the provider's answer, and a
-    diagnostic further down (a retry, a JSON body, an earlier label) must not turn a Codex
-    compaction failure or a bad request into "your key was refused"."""
+def _provider_failure_kind(err: str) -> str:
+    """What the provider's answer on the org's own connection was: "refused" (it would not take the key),
+    "model" (it took the key and refused this model for it), "quota" (the account behind it has no quota or
+    credit), "rate_limit" (too many requests for now), or "" (not the provider turning the request down).
+    Judged on the first line only: that is the line the runner chose as the provider's answer, and a
+    diagnostic further down (a retry, a JSON body, an earlier label) must not turn a Codex compaction
+    failure or a bad request into "your key was refused"."""
     first = (err or "").split("\n", 1)[0]
     # A 401 from the runner's own MCP relay (an address under /hr-mcp-) is not the provider refusing the
     # key: OpenHands' follow-ups read "Your vercel key was refused" over the relay's "unknown relay token" (#714).
-    if "/hr-mcp-" in first:
-        return False
-    return bool(_PROVIDER_REFUSAL_RE.search(first))
+    # The runner's loopback relay for the provider says the same thing when a turn's token is not (or no longer) routed:
+    # '401 {"error": "unknown relay token"}' on a 127.0.0.1 address, which is never the provider and never the key.
+    if "/hr-mcp-" in first or "unknown relay token" in first.lower() or not _PROVIDER_REFUSAL_RE.search(first):
+        return ""
+    if _PROVIDER_NO_CREDIT_RE.search(first):          # a code or sentence that can only mean no credit
+        return "quota"
+    if _PROVIDER_RETRY_AFTER_RE.search(first):        # a provider names a wait only when waiting helps
+        return "rate_limit"
+    if _PROVIDER_PLAN_QUOTA_RE.search(first):         # the plan's quota, with no wait named
+        return "quota"
+    if _PROVIDER_RATE_LIMIT_RE.search(first):
+        return "rate_limit"
+    if _PROVIDER_NO_QUOTA_RE.search(first):
+        return "quota"
+    if _PROVIDER_MODEL_REFUSED_RE.search(first):
+        return "model"
+    return "refused"
+
+
+def _provider_refused(err: str) -> bool:
+    """Whether the provider turned the org's own connection down (any of _provider_failure_kind's four). The turn
+    stops there rather than move on to another connection, as it always has; only what it says differs by kind."""
+    return bool(_provider_failure_kind(err))
+
+
+def _provider_retry_after(err: str) -> float | None:
+    """The wait, in seconds, the provider's first line asks for, when it names one."""
+    m = _PROVIDER_RETRY_AFTER_RE.search((err or "").split("\n", 1)[0])
+    if not m:
+        return None
+    n, unit = float(m.group(1)), (m.group(2) or "s").lower()
+    return n / 1000 if unit.startswith("ms") or unit.startswith("milli") else n * 60 if unit.startswith("m") else n
+
+
+def _provider_failure_detail(err: str) -> dict:
+    """The error.detail fields that say why the provider turned the turn down and whether a retry can succeed,
+    so a client with automatic retries stops on a refused key or an empty account instead of matching words
+    in the message. Empty when the provider's line is not one of the four. None of the provider's text."""
+    kind = _provider_failure_kind(err)
+    if not kind:
+        return {}
+    reason, retryable = _PROVIDER_FAILURE_REASONS[kind]
+    out: dict = {"reason": reason, "retryable": retryable}
+    wait = _provider_retry_after(err) if kind == "rate_limit" else None
+    if wait is not None:
+        out["retry_after_seconds"] = wait
+    return out
 
 
 # A Responses provider refusing a replayed history: OpenAI's encrypted reasoning items are opened
@@ -5277,8 +5347,26 @@ def _refusal_message(conn: dict | None, err: str) -> str:
     # connection carries the runner's wiring (`provider`, e.g. "tokenrouter" for any OpenAI-format
     # custom endpoint on some bases) and keeps the vendor in `_vendor`.
     provider = str((conn or {}).get("_vendor") or (conn or {}).get("provider") or "your provider")
+    # A custom endpoint has no vendor's name to give, and "add credit with custom" names nobody: it is called by the
+    # name the person gave the connection.
+    if provider == "custom":
+        cname = str((conn or {}).get("name") or "")
+        provider = (cname.split(":", 1)[1] if cname.startswith("integration:") else cname).strip() or "custom endpoint"
     what = "connection" if str((conn or {}).get("auth") or "").strip().lower() == "entra" else "key"
-    return f"Your {provider} {what} was refused: {err or 'the provider returned an error'}"
+    said = err or "the provider returned an error"
+    kind = _provider_failure_kind(err)
+    if kind == "rate_limit":
+        wait = _provider_retry_after(err)
+        when = (f"It asked to wait {wait:g} s before trying again." if wait is not None and wait < 120
+                else f"It asked to wait {wait / 60:.0f} min before trying again." if wait is not None
+                else "Wait a minute and try again.")
+        return f"{provider} rate-limited this task (too many requests for now; your {what} was not refused). {when} {said}"
+    if kind == "quota":
+        return f"Your {provider} account has no quota or credit left for this {what}; add credit with {provider}, then try again: {said}"
+    if kind == "model":
+        return (f"{provider} refused this model for your {what} (the {what} itself was accepted). Choose another model, "
+                f"or enable this one for your account with {provider}: {said}")
+    return f"Your {provider} {what} was refused: {said}"
 
 
 def _failure_detail(rec: dict) -> dict:
@@ -5293,6 +5381,8 @@ def _failure_detail(rec: dict) -> dict:
     tool = str((rec.get("error_detail") or {}).get("tool") or "")
     if tool:
         detail["tool"] = tool
+    # why the provider turned the org's own connection down, and whether a retry can succeed
+    detail.update(rec.get("provider_failure") or {})
     return detail
 
 
@@ -8064,19 +8154,83 @@ class _RespTranslator:
 
 
 # ── input parsing (string | array of items with input_text/input_file/input_image) ──────
+def _given_filename(p: dict) -> str | None:
+    """The name a part gives its file, or None: a value that is not a name (a number, an object, blank) is no name,
+    rather than something the turn later joins into its prompt as if it were one."""
+    name = p.get("filename")
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def _b64_or_none(b64: str) -> str | None:
+    """The base64 payload with any line breaks taken out, or None when it does not decode. The runner writes what
+    decodes and skips what does not, while the prompt still says the file is there, so a payload that is not
+    base64 is refused at the parse, where the caller is told, not dropped in the runner."""
+    b64 = "".join(b64.split())
+    try:
+        return b64 if b64 and base64.b64decode(b64, validate=True) else None
+    except ValueError:
+        return None
+
+
 def _decode_input_file(p: dict) -> tuple[str | None, str | None, str | None, str | None]:
     """→ (filename, base64, media_type, file_id). base64/file_id are mutually exclusive sources."""
-    fname = p.get("filename")
+    fname = _given_filename(p)
     fd = p.get("file_data")
     if isinstance(fd, str) and fd:
         media, b64 = "application/octet-stream", fd
         if fd.startswith("data:"):
             head, _, b64 = fd.partition(",")
             media = head[5:].split(";")[0] or media
-        return fname, b64, media, None
+        # An inline file used to be dropped in silence when it had no name or its bytes did not decode: the
+        # request answered 200 and the agent never saw it, as an input_image was.
+        if not fname:
+            raise uhp_error(400, "invalid_input", "An input_file sent inline (file_data) carries a filename: "
+                                                  "the name the agent finds it under.", "input")
+        payload = "".join(b64.split())
+        # A zero-byte file is a file (the console sends one for an empty attachment) and is kept as before; only
+        # a payload that is there and does not decode is refused.
+        if payload and _b64_or_none(payload) is None:
+            raise uhp_error(400, "invalid_input", "An input_file's file_data is base64, as a data URL "
+                                                  "(data:application/pdf;base64,...) or on its own.", "input")
+        return fname, payload, media, None
     if p.get("file_id"):
         return fname, None, None, p["file_id"]
-    return fname, None, None, None
+    raise uhp_error(400, "invalid_input", "An input_file carries file_data (inline) or file_id.", "input")
+
+
+# An input_image reaches the agent the way an input_file does: as a file in its working directory. It used to be
+# kept in the turn's record and nowhere else, so the agent never saw it, the request still answered 200 with
+# ignored_fields [], and the agent said no image was attached. Tasks §2 says an image comes inline or by file_id;
+# a URL is not fetched (the server would be reaching an address the caller picked), and a part that can't be read
+# is refused by name.
+_INPUT_IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/gif": "gif",
+                    "image/webp": "webp", "image/heic": "heic", "image/heif": "heif"}
+
+
+def _decode_input_image(p: dict) -> tuple[str | None, str | None, str | None, str | None]:
+    """→ (filename, base64, media_type, file_id), as _decode_input_file. Inline: a data URL, as a string or
+    as {"url": ...} (the Chat Completions spelling), named from its bytes so the same image under two turns
+    is one file. By file_id: the name comes from the upload's sidecar unless the part names one."""
+    url = p.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    given = _given_filename(p)
+    if isinstance(url, str) and url:
+        if not url.startswith("data:"):
+            raise uhp_error(400, "invalid_input", "An input_image is sent inline as a data URL (data:image/png;base64,...) "
+                                                  "or by file_id from POST /v1/files; an image URL is not fetched.", "input")
+        head, _, b64 = url.partition(",")
+        media = head[5:].split(";")[0].lower()
+        ext = _INPUT_IMAGE_EXT.get(media)
+        b64 = _b64_or_none(b64) or ""
+        if not ext or ";base64" not in head or not b64:
+            raise uhp_error(400, "invalid_input", "An input_image's data URL is a base64 image "
+                                                  f"({', '.join(sorted(set(_INPUT_IMAGE_EXT.values())))}).", "input")
+        name = given or f"image-{hashlib.sha256(b64.encode()).hexdigest()[:12]}.{ext}"
+        return name, b64, media, None
+    if p.get("file_id"):
+        return given, None, None, p["file_id"]
+    raise uhp_error(400, "invalid_input", "An input_image carries image_url (a data URL) or file_id.", "input")
 
 
 def _parse_input(inp) -> tuple[str, list[dict], list[dict]]:
@@ -8111,7 +8265,10 @@ def _parse_input(inp) -> tuple[str, list[dict], list[dict]]:
                     files.append({"filename": fname, "content_b64": b64, "file_id": file_id, "media_type": media})
                 parts.append({"type": "input_file", "filename": fname, "file_id": file_id})
             elif pt == "input_image":
-                parts.append({"type": "input_image", "image_url": p.get("image_url"), "file_id": p.get("file_id")})
+                fname, b64, media, file_id = _decode_input_image(p)
+                files.append({"filename": fname, "content_b64": b64, "file_id": file_id, "media_type": media})
+                # the record keeps the name, as an input_file's does, not the bytes
+                parts.append({"type": "input_image", "filename": fname, "file_id": file_id})
         items_norm.append({"role": role, "content": parts})
     return "\n\n".join(t for t in texts if t).strip(), files, items_norm
 
@@ -11529,6 +11686,7 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
             # so the rule is the refusal itself, not which store the key came from. Other failures
             # (a transient error, a timeout) still move on to the next connection.
             rec["error_message"] = _refusal_message(conn, _last_err)
+            rec["provider_failure"] = _provider_failure_detail(_last_err)
             status = "failed"
             rec["status"] = "failed"
             await _vertex_upsert(sid, {"status": "failed", "turn_status": "failed", "last_connection": name})
@@ -15221,26 +15379,24 @@ async def _ssrf_check(url: str) -> str | None:
     common setup, the operator already has full access to that machine, and blocking it would
     remove a real capability while protecting nobody from anybody.
     """
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url)
+        # urlparse checks a port only when it is read, so it is read here: "host:abc" or "host:99999" is an
+        # address that is not valid, and reading it later raised past every caller as a 500.
+        port = u.port
+    except Exception:  # noqa: BLE001
+        return "invalid url"
     if _pool_is_local():
-        from urllib.parse import urlparse
-        try:
-            u = urlparse(url)
-        except Exception:  # noqa: BLE001
-            return "invalid url"
         if u.scheme not in ("http", "https"):
             return "MCP endpoints must be http or https"
         return None if u.hostname else "url has no host"
 
-    from urllib.parse import urlparse
-    try:
-        u = urlparse(url)
-    except Exception:  # noqa: BLE001
-        return "invalid url"
     if u.scheme != "https":
         return "only https MCP endpoints are allowed"
     if not u.hostname:
         return "url has no host"
-    return await _internal_target(u.hostname, u.port or 443)
+    return await _internal_target(u.hostname, port or 443)
 
 
 # The internal ranges Python's own classifiers do not call internal. Named here rather than folded
@@ -15720,7 +15876,15 @@ def _db_parse(engine: str, conn: str) -> tuple[str, str]:
         raise uhp_error(400, "invalid_connection_string",
                         "That connection string names no database — add /yourdatabase to the end.",
                         "connection_string")
-    host = u.hostname + (f":{u.port}" if u.port else "")
+    try:
+        port = u.port
+        if port == 0:
+            raise ValueError
+    except ValueError as e:
+        raise uhp_error(400, "invalid_connection_string",
+                        "The port must be a number from 1 to 65535.",
+                        "connection_string") from e
+    host = u.hostname + (f":{port}" if port else "")
     return host, db
 
 
@@ -17090,11 +17254,12 @@ async def _provider_url_check(url: str) -> str | None:
     refused = "the finished file was offered from an address this will not fetch"
     try:
         u = urlparse(url)
+        port = u.port   # checked only when read (a port that is not a number, or out of range)
     except Exception:  # noqa: BLE001
         return refused
     if u.scheme not in ("http", "https") or not u.hostname:
         return refused
-    bad = await _internal_target(u.hostname, u.port or (443 if u.scheme == "https" else 80))
+    bad = await _internal_target(u.hostname, port or (443 if u.scheme == "https" else 80))
     if not bad:
         return None
     # The host, in the log, where an operator can act on it — and only the host: a result_url
@@ -19626,8 +19791,14 @@ async def _plug_save(org: str, workspace: str, plug_type: str, body: PlugBody) -
         # memories on it must not go dark because someone pasted a wrong key.
         base_url = str(config.get("base_url") or "").strip()
         if base_url:
-            if await _ssrf_check(base_url):
-                raise uhp_error(422, "memory_invalid", "That address can't be used here: it must be https, on a public address.", "config.base_url")
+            why = await _ssrf_check(base_url)
+            if why:
+                # said as what is wrong with it: "must be https, on a public address" was said for every refusal, so an
+                # address with a port that is not a number read as a rule this self-hosted instance does not have
+                said = {"invalid url": "it is not a valid address", "url has no host": "it has no host",
+                        "MCP endpoints must be http or https": "it must be http or https"}.get(
+                            why, "it must be https, on a public address")
+                raise uhp_error(422, "memory_invalid", f"That address can't be used here: {said}.", "config.base_url")
             own = _own_service_address(base_url)
             if own:
                 raise uhp_error(422, "memory_invalid", f"That address can't be used: {own}.", "config.base_url")
@@ -22512,9 +22683,10 @@ def _own_service_address(url: str) -> str:
     """Why this address is this instance's own gateway or runner, which is not a memory service."""
     try:
         u = urllib.parse.urlsplit(url)
+        port = u.port or 0   # checked only when read (a port that is not a number, or out of range)
     except ValueError:
         return "it is not a valid address"
-    if (u.hostname or "") in ("localhost", "127.0.0.1", "::1") and (u.port or 0) in (3000, 8080, 8081):
+    if (u.hostname or "") in ("localhost", "127.0.0.1", "::1") and port in (3000, 8080, 8081):
         return "it is this instance itself"
     return ""
 
@@ -24086,6 +24258,22 @@ def _skill_key(name: str) -> str:
     """The runner's skill directory name (its _skill_dir_name), so two skills the gateway sees
     as different cannot land in one folder."""
     return re.sub(r"[^A-Za-z0-9_-]+", "-", str(name or ""))
+def _plugin_json(raw: dict, path: str) -> tuple[object, str]:
+    """(the document, "") or (None, why it does not parse). The why is the parser's reason and where it stopped,
+    so a person can find the mistake (#725), and never the file's text."""
+    try:
+        text = raw.get("content") if raw.get("content") is not None \
+            else base64.b64decode(raw.get("content_b64") or "").decode()
+    except ValueError:   # binascii.Error and UnicodeDecodeError are both ValueErrors
+        return None, f"{path} is not UTF-8 text"
+    try:
+        return json.loads(text), ""
+    except json.JSONDecodeError as e:
+        return None, f"{path} is not valid JSON: {e.msg} at line {e.lineno} column {e.colno}"
+    except (TypeError, ValueError, RecursionError):
+        return None, f"{path} is not valid JSON"
+
+
 def _plugin_invalid(name: str, path: str, reason: str) -> HTTPException:
     return uhp_error(422, "plugin_invalid", f"Plugin {name or 'package'}: {reason}", "plugins",
                      {"path": path, "reason": reason})
@@ -24261,11 +24449,9 @@ def _plugin_read_package(files: list, sent_name: str | None = None) -> dict:
     raw = by_path.get("plugin.json")
     if raw is None:
         raise _plugin_invalid(sent_name or "", "plugin.json", "no plugin.json at the plugin root")
-    try:
-        manifest = json.loads(raw.get("content") if raw.get("content") is not None
-                              else base64.b64decode(raw.get("content_b64") or "").decode())
-    except Exception:  # noqa: BLE001
-        raise _plugin_invalid(sent_name or "", "plugin.json", "plugin.json is not valid JSON")
+    manifest, why = _plugin_json(raw, "plugin.json")
+    if why:
+        raise _plugin_invalid(sent_name or "", "plugin.json", why)
     if not isinstance(manifest, dict):
         raise _plugin_invalid(sent_name or "", "plugin.json", "plugin.json is not an object")
     if "$schema" not in manifest:
@@ -24312,13 +24498,13 @@ def _plugin_read_package(files: list, sent_name: str | None = None) -> dict:
     servers: list[dict] = []
     raw = by_path.get("mcp.json")
     if raw is not None:
-        try:
-            mcp = json.loads(raw.get("content") if raw.get("content") is not None
-                             else base64.b64decode(raw.get("content_b64") or "").decode())
-        except Exception:  # noqa: BLE001
-            mcp = None
+        mcp, why = _plugin_json(raw, "mcp.json")
         entries = mcp.get("mcpServers") if isinstance(mcp, dict) else None
-        if not isinstance(mcp, dict) or set(mcp) != {"$schema", "mcpServers"} or not isinstance(entries, dict):
+        if why:
+            # it said "not an object of exactly $schema and mcpServers", which sent people looking at the keys
+            skipped.append({"path": "mcp.json", "reason": why})
+            entries = {}
+        elif not isinstance(mcp, dict) or set(mcp) != {"$schema", "mcpServers"} or not isinstance(entries, dict):
             skipped.append({"path": "mcp.json", "reason": "not an object of exactly $schema and mcpServers"})
             entries = {}
         elif mcp.get("$schema") != _PLUGIN_MCP_SCHEMA:
@@ -26056,6 +26242,7 @@ async def _cloud_base_refused(base: str) -> str | None:
     from urllib.parse import urlparse
     try:
         u = urlparse(str(base or ""))
+        port = u.port   # checked only when read (a port that is not a number, or out of range)
     except ValueError:
         return "invalid url"
     if not u.hostname:
@@ -26064,7 +26251,7 @@ async def _cloud_base_refused(base: str) -> str | None:
         return None if u.scheme in ("http", "https") else "the address must be http or https"
     if u.scheme != "https":
         return "only https addresses are allowed"
-    return await _internal_target(u.hostname, u.port or 443)
+    return await _internal_target(u.hostname, port or 443)
 
 
 class _CloudKeyRefused(HTTPException):
