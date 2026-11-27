@@ -34,6 +34,7 @@ import errno
 import grp
 import hashlib
 import json
+import lzma
 import mimetypes
 import platform
 import pwd
@@ -54,6 +55,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -64,6 +66,10 @@ ENV_MOUNT = os.environ.get("HR_ENV_MOUNT", "/env")
 BUILD_TIMEOUT = int(os.environ.get("HR_ENV_BUILD_TIMEOUT", "1800"))     # the whole build, seconds
 LOG_MAX = 200_000                                                        # characters of build log kept
 TREE_MAX = 20_000                                                        # entries a tree listing returns
+# What one archive import may unpack to. The upload's own size says little (a zip of zeros is ~1000:1),
+# and extraction stages under /tmp, which on a shared runner is every organization's disk.
+ARCHIVE_MAX_BYTES = int(os.environ.get("HR_ENV_ARCHIVE_MAX_BYTES", str(2 * 1024 ** 3)))   # unpacked bytes
+ARCHIVE_MAX_MEMBERS = int(os.environ.get("HR_ENV_ARCHIVE_MAX_MEMBERS", "100000"))          # entries
 # Dependency and cache directories never copied from the source into a build: the build installs
 # its own, from the manifests, in the image's own toolchain (a venv copied from a laptop is the
 # thing SPI-001 says not to trust).
@@ -409,25 +415,51 @@ def _member_ok(name: str) -> str | None:
     return n.strip("/")
 
 
-def import_archive(env_id: str, data_path: str, *, replace: bool = False) -> dict:
-    """Extract a zip or tar archive into the source. Only regular files and directories land:
-    symlinks, hard links, devices and any member that names a path outside the source are
-    dropped and counted, never written. A single wrapping directory is stripped.
-
-    The lock is held from the replace through the last member, so a build snapshotting while this
-    runs waits instead of copying a tree half-refilled. The wait is bounded by the archive."""
-    with _source_lock(env_id):
-        return _import_archive(env_id, data_path, replace=replace)
+_ARCHIVE_ERRORS = (zipfile.BadZipFile, tarfile.TarError, EOFError, zlib.error, lzma.LZMAError)
 
 
-def _import_archive(env_id: str, data_path: str, *, replace: bool = False) -> dict:
-    src = source_dir(env_id)
-    if replace and src.exists():
-        shutil.rmtree(src)
-    src = _source(env_id)
+class _Budget:
+    """The bytes an archive may still unpack to, counted as they are written: a member's declared size
+    is the archive's own claim and is not trusted."""
+
+    def __init__(self) -> None:
+        self.left = ARCHIVE_MAX_BYTES
+
+    def copy(self, fin, fout) -> None:
+        while True:
+            chunk = fin.read(1024 * 1024)
+            if not chunk:
+                return
+            self.left -= len(chunk)
+            if self.left < 0:
+                raise HTTPException(413, f"the archive unpacks to more than {ARCHIVE_MAX_BYTES} bytes")
+            fout.write(chunk)
+
+
+def _too_many_members() -> HTTPException:
+    return HTTPException(413, f"the archive holds more than {ARCHIVE_MAX_MEMBERS} entries")
+
+
+def _tar_members(tf: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    """The members, read one header at a time and stopped past the cap: getmembers() reads every
+    header first, and a small compressed tar can hold millions."""
+    out = []
+    while (m := tf.next()) is not None:
+        out.append(m)
+        if len(out) > ARCHIVE_MAX_MEMBERS:
+            raise _too_many_members()
+    return out
+
+
+def _extract_archive(data_path: str, dst: pathlib.Path) -> tuple[int, int]:
+    """Extract a zip or tar archive into a private staging directory, at most ARCHIVE_MAX_MEMBERS
+    entries and ARCHIVE_MAX_BYTES unpacked."""
     written = skipped = 0
+    budget = _Budget()
     if zipfile.is_zipfile(data_path):
         with zipfile.ZipFile(data_path) as zf:
+            if len(zf.infolist()) > ARCHIVE_MAX_MEMBERS:
+                raise _too_many_members()
             names = [i.filename for i in zf.infolist()]
             root = _strip_common_root(names)
             for info in zf.infolist():
@@ -442,19 +474,21 @@ def _import_archive(env_id: str, data_path: str, *, replace: bool = False) -> di
                 if stat.S_ISLNK(mode):
                     skipped += 1
                     continue
-                dest = _safe_rel(src, rel)
+                dest = _safe_rel(dst, rel)
                 if info.is_dir():
                     dest.mkdir(parents=True, exist_ok=True)
                     continue
+                if info.flag_bits & 0x1:
+                    raise HTTPException(400, "encrypted zip archives are not supported")
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as fin, open(dest, "wb") as fout:
-                    shutil.copyfileobj(fin, fout)
+                    budget.copy(fin, fout)
                 if mode & 0o111:
                     os.chmod(dest, 0o755)
                 written += 1
     elif tarfile.is_tarfile(data_path):
         with tarfile.open(data_path) as tf:
-            members = tf.getmembers()
+            members = _tar_members(tf)
             root = _strip_common_root([m.name for m in members])
             for m in members:
                 rel = _member_ok(m.name)
@@ -467,7 +501,7 @@ def _import_archive(env_id: str, data_path: str, *, replace: bool = False) -> di
                 if not (m.isreg() or m.isdir()):
                     skipped += 1
                     continue
-                dest = _safe_rel(src, rel)
+                dest = _safe_rel(dst, rel)
                 if m.isdir():
                     dest.mkdir(parents=True, exist_ok=True)
                     continue
@@ -477,18 +511,62 @@ def _import_archive(env_id: str, data_path: str, *, replace: bool = False) -> di
                     skipped += 1
                     continue
                 with fin, open(dest, "wb") as fout:
-                    shutil.copyfileobj(fin, fout)
+                    budget.copy(fin, fout)
                 if m.mode & 0o111:
                     os.chmod(dest, 0o755)
                 written += 1
     else:
         raise HTTPException(400, "the upload is neither a zip nor a tar archive")
-    return {"written": written, "skipped": skipped, **source_stat(env_id)}
+    return written, skipped
+
+
+def import_archive(env_id: str, data_path: str, *, replace: bool = False) -> dict:
+    """Extract a zip or tar archive into the source. Only regular files and directories land:
+    symlinks, hard links, devices and any member that names a path outside the source are
+    dropped and counted, never written. A single wrapping directory is stripped.
+
+    Extraction runs in a private staging directory outside the source lock so an invalid,
+    corrupt or self-conflicting upload fails with 400 without touching the existing source and a
+    build snapshot never waits on decompression."""
+    _check_id(env_id)
+    with tempfile.TemporaryDirectory(prefix="hr-env-archive-") as tmp:
+        stage = pathlib.Path(tmp) / "stage"
+        stage.mkdir(mode=0o700)
+        try:
+            written, skipped = _extract_archive(data_path, stage)
+        except (*_ARCHIVE_ERRORS, NotImplementedError) as e:
+            raise HTTPException(400, f"the archive is corrupt or unreadable: {e}")
+        except (FileExistsError, IsADirectoryError, NotADirectoryError):
+            raise HTTPException(400, "the archive contains conflicting file and directory paths")
+        except OSError as e:
+            # Corrupt gzip (BadGzipFile) and bz2 streams raise OSError with errno=None.
+            # Real disk errors carry an errno.
+            if e.errno is None:
+                raise HTTPException(400, f"the archive is corrupt or unreadable: {e}")
+            raise
+        with _source_lock(env_id):
+            src = source_dir(env_id)
+            if replace and src.exists():
+                shutil.rmtree(src)
+            # Member counts come from extraction. _copy_without_links checks containment and skips links.
+            _copy_without_links(str(stage), _source(env_id))
+            stat_out = source_stat(env_id)
+    return {"written": written, "skipped": skipped, **stat_out}
 
 
 def _copy_without_links(src_root: str, dst: pathlib.Path) -> tuple[int, int]:
     """Copy a tree's regular files and directories into dst; a link, a device or a fifo is counted
     and left behind, never followed. Returns (written, skipped)."""
+    # Check every destination path up front so an escaping symlink already in dst refuses the
+    # whole copy instead of writing outside dst or leaving partial files behind.
+    for dirpath, dirnames, filenames in os.walk(src_root):
+        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+        rel = os.path.relpath(dirpath, src_root)
+        if rel != ".":
+            _safe_rel(dst, rel)
+        for f in filenames:
+            if stat.S_ISREG(os.lstat(os.path.join(dirpath, f)).st_mode):
+                _safe_rel(dst, f if rel == "." else os.path.join(rel, f))
     written = skipped = 0
     for dirpath, dirnames, filenames in os.walk(src_root):   # os.walk does not descend a linked directory
         keep = []
@@ -499,7 +577,7 @@ def _copy_without_links(src_root: str, dst: pathlib.Path) -> tuple[int, int]:
                 keep.append(d)
         dirnames[:] = keep
         rel = os.path.relpath(dirpath, src_root)
-        out = dst if rel == "." else dst / rel
+        out = dst if rel == "." else _safe_rel(dst, rel)
         out.mkdir(parents=True, exist_ok=True)
         for f in filenames:
             p = os.path.join(dirpath, f)
@@ -520,25 +598,55 @@ def _copy_without_links(src_root: str, dst: pathlib.Path) -> tuple[int, int]:
 def _git_pin_args(url: str, pin: str) -> list[str]:
     """`git -c` settings that make the clone connect to the address the gateway classified.
 
-    `pin` is "<host>:<port>:<address>" from the gateway, on a deployment shared by several
-    organizations; empty otherwise. Without it git resolved the name again when it connected, so a
-    name that answered a public address to the gateway's check and an internal one a moment later
-    reached the internal one. Over http(s), curl is told the address for that host and port, and
-    redirects are not followed (one to another host would be resolved afresh); over ssh, ssh
-    connects to the address and still checks the host key under the name."""
+    `pin` is "<host>:<port>:<address>" (with an IPv6 host bracketed as "[<host>]:<port>:<address>")
+    from the gateway, on a deployment shared by several organizations; empty otherwise. Without it
+    git resolved the name again when it connected, so a name that answered a public address to the
+    gateway's check and an internal one a moment later reached the internal one. Over http(s), curl
+    is told the address for that host and port (unless the URL host is already a matching IPv6
+    literal, which curl rejects in CURLOPT_RESOLVE and does not resolve via DNS), and redirects are
+    not followed (one to another host would be resolved afresh); over ssh, ssh connects to the
+    address and still checks the host key under the name."""
     if not pin:
         return []
-    host, _, rest = pin.partition(":")
-    port, _, addr = rest.partition(":")
+    if "%" in pin:
+        # ipaddress takes ANY text after an IPv6 "%" as a zone id ("2606::1%$(id)" parses), and
+        # core.sshCommand below is run by a shell. The gateway never pins a zone id; refuse one.
+        raise HTTPException(400, "git pin is not host:port:address")
+    if pin.startswith("["):
+        host, sep, rest = pin[1:].partition("]:")
+        try:
+            host_ip = ipaddress.ip_address(host) if sep else None
+        except ValueError:
+            host_ip = None
+        if host_ip is None or host_ip.version != 6:
+            raise HTTPException(400, "git pin is not host:port:address")
+    else:
+        host, sep, rest = pin.partition(":")
+        if not sep:
+            raise HTTPException(400, "git pin is not host:port:address")
+        host_ip = None
+    port, sep2, addr = rest.partition(":")
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
         raise HTTPException(400, "git pin is not host:port:address")
-    if not (host and port.isdigit()):
+    if not (host and sep2 and port.isdigit() and 1 <= int(port) <= 65535):
         raise HTTPException(400, "git pin is not host:port:address")
     if url.startswith(("https://", "http://")):
+        if host_ip is not None:
+            try:
+                p = urllib.parse.urlparse(url)
+                url_ip = ipaddress.ip_address(p.hostname or "")
+                url_port = p.port or (80 if p.scheme == "http" else 443)
+            except ValueError:
+                raise HTTPException(400, "git pin does not match git url")
+            if url_ip != host_ip or ip != host_ip or p.port == 0 or url_port != int(port):
+                raise HTTPException(400, "git pin does not match git url")
+            return ["-c", "http.followRedirects=false"]
         shown = f"[{ip}]" if ip.version == 6 else str(ip)
         return ["-c", f"http.curloptResolve={host}:{port}:{shown}", "-c", "http.followRedirects=false"]
+    if host_ip is not None:
+        return ["-c", f"core.sshCommand=ssh -o HostName={ip} -o HostKeyAlias={host_ip}"]
     if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
         raise HTTPException(400, "git pin names an invalid host")
     return ["-c", f"core.sshCommand=ssh -o HostName={ip} -o HostKeyAlias={host}"]

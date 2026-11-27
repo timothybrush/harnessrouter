@@ -110,6 +110,153 @@ def test_import_keeps_a_single_file_with_or_without_a_wrapping_directory(
     assert {e["path"] for e in E.tree("henv_single")} == {"new.txt"}
 
 
+def test_failed_archive_import_preserves_existing_source(store, tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    E.write_file("henv_keep", "scripts/render.py", b"print('keep')\n")
+    os.chmod(E.source_dir("henv_keep") / "scripts" / "render.py", 0o755)
+    E.write_file("henv_keep", "config.yaml", b"a: 1\n")
+
+    bad_txt = tmp_path / "bad.txt"
+    bad_txt.write_bytes(b"not an archive\n")
+
+    corrupt_zip = tmp_path / "corrupt.zip"
+    with zipfile.ZipFile(corrupt_zip, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("good.txt", b"first\n")
+        zf.writestr("broken.txt", b"hello world " * 10)
+    zraw = bytearray(corrupt_zip.read_bytes())
+    zraw[zraw.find(b"hello world")] ^= 0xFF
+    corrupt_zip.write_bytes(bytes(zraw))
+    assert zipfile.is_zipfile(corrupt_zip)
+
+    trunc_tar = tmp_path / "trunc.tar.gz"
+    with tarfile.open(trunc_tar, "w:gz") as tf:
+        for i in range(5):
+            payload = (f"file {i} " * 200).encode()
+            ti = tarfile.TarInfo(f"f{i}.txt")
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
+    traw = trunc_tar.read_bytes()
+    trunc_tar.write_bytes(traw[:len(traw) // 2])
+    assert tarfile.is_tarfile(trunc_tar)
+
+    conflict_zip = tmp_path / "conflict.zip"
+    with zipfile.ZipFile(conflict_zip, "w") as zf:
+        zf.writestr("other.txt", b"ok\n")
+        zf.writestr("foo", b"as file\n")
+        zf.writestr("foo/bar.txt", b"nested\n")
+
+    for bad_path in (bad_txt, corrupt_zip, trunc_tar, conflict_zip):
+        with pytest.raises(HTTPException) as exc:
+            E.import_archive("henv_keep", str(bad_path), replace=True)
+        assert exc.value.status_code == 400, bad_path.name
+        assert E.source_stat("henv_keep") == {"count": 2, "bytes": 19}, bad_path.name
+        assert E.read_file("henv_keep", "scripts/render.py")[0] == b"print('keep')\n"
+        assert os.stat(E.source_dir("henv_keep") / "scripts" / "render.py").st_mode & 0o111
+
+    with pytest.raises(HTTPException) as exc:
+        E.import_archive("henv_keep", str(corrupt_zip), replace=False)
+    assert exc.value.status_code == 400
+    assert not (E.source_dir("henv_keep") / "good.txt").exists()
+
+    with pytest.raises(HTTPException) as exc:
+        E.import_archive("henv_never", str(bad_txt), replace=True)
+    assert exc.value.status_code == 400
+    assert not E.env_dir("henv_never").exists()
+
+    app = FastAPI()
+    app.include_router(E.router)
+    resp = TestClient(app).post("/environments/henv_keep/import", params={"replace": 1}, content=b"not an archive")
+    assert resp.status_code == 400
+    assert E.source_stat("henv_keep") == {"count": 2, "bytes": 19}
+
+
+def test_an_archive_that_unpacks_past_the_caps_is_refused_and_leaves_nothing(store, tmp_path, monkeypatch):
+    """A small upload can unpack to a full disk (a zip of zeros is about 1000:1), and staging is under
+    /tmp, every organization's disk on a shared runner. The bytes are counted as they are written,
+    never taken from the archive's own size fields, and the entries are counted before any is."""
+    import tempfile
+
+    stage_root = tmp_path / "tmp"
+    stage_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(stage_root))
+    monkeypatch.setattr(E, "ARCHIVE_MAX_BYTES", 10_000)
+    monkeypatch.setattr(E, "ARCHIVE_MAX_MEMBERS", 5)
+    E.write_file("henv_cap", "keep.txt", b"keep\n")
+
+    zbomb = tmp_path / "zeros.zip"
+    with zipfile.ZipFile(zbomb, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("a.txt", b"ok\n")
+        zf.writestr("zeros.bin", b"\0" * 50_000)
+    tbomb = tmp_path / "zeros.tar.gz"
+    with tarfile.open(tbomb, "w:gz") as tf:
+        for name, size in (("a.txt", 3), ("b.bin", 6_000), ("c.bin", 6_000)):   # past the cap only together
+            ti = tarfile.TarInfo(name)
+            ti.size = size
+            tf.addfile(ti, io.BytesIO(b"\0" * size))
+    many_zip = tmp_path / "many.zip"
+    with zipfile.ZipFile(many_zip, "w") as zf:
+        for i in range(6):
+            zf.writestr(f"f{i}.txt", b"x")
+    many_tar = tmp_path / "many.tar"
+    with tarfile.open(many_tar, "w") as tf:
+        for i in range(6):
+            ti = tarfile.TarInfo(f"f{i}.txt")
+            ti.size = 1
+            tf.addfile(ti, io.BytesIO(b"x"))
+
+    for bad, says in ((zbomb, "unpacks to more than 10000 bytes"), (tbomb, "unpacks to more than 10000 bytes"),
+                      (many_zip, "more than 5 entries"), (many_tar, "more than 5 entries")):
+        for replace in (True, False):
+            with pytest.raises(HTTPException) as exc:
+                E.import_archive("henv_cap", str(bad), replace=replace)
+            assert exc.value.status_code == 413 and says in exc.value.detail, (bad.name, exc.value.detail)
+            assert E.source_stat("henv_cap") == {"count": 1, "bytes": 5}, bad.name
+            assert list(stage_root.iterdir()) == [], bad.name
+
+    ok = tmp_path / "five.zip"
+    with zipfile.ZipFile(ok, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i in range(5):
+            zf.writestr(f"f{i}.txt", b"\0" * 2_000)                   # exactly at both caps
+    assert E.import_archive("henv_cap", str(ok), replace=True)["written"] == 5
+    assert list(stage_root.iterdir()) == []
+
+
+def test_archive_import_refuses_escape_symlink_and_preserves_merge_modes(store, tmp_path):
+    E.write_file("henv_sym", "keep.txt", b"ok\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, E.source_dir("henv_sym") / "linkdir")
+
+    escape_zip = tmp_path / "escape.zip"
+    with zipfile.ZipFile(escape_zip, "w") as zf:
+        zf.writestr("a.txt", b"partial\n")
+        zf.writestr("linkdir/pwn.txt", b"escape\n")
+
+    with pytest.raises(HTTPException) as exc:
+        E.import_archive("henv_sym", str(escape_zip), replace=False)
+    assert exc.value.status_code == 400
+    assert not (outside / "pwn.txt").exists()
+    assert not (E.source_dir("henv_sym") / "a.txt").exists()
+
+    E.write_file("henv_merge", "existing.txt", b"keep\n")
+    merge_tar = tmp_path / "merge.tar.gz"
+    with tarfile.open(merge_tar, "w:gz") as tf:
+        for name, data, mode in (("bin/run.sh", b"#!/bin/sh\necho ok\n", 0o755), ("note.txt", b"hi\n", 0o644)):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            ti.mode = mode
+            tf.addfile(ti, io.BytesIO(data))
+
+    E.import_archive("henv_merge", str(merge_tar), replace=False)
+    src = E.source_dir("henv_merge")
+    assert (src / "existing.txt").read_bytes() == b"keep\n"
+    assert os.stat(src / "bin" / "run.sh").st_mode & 0o111
+    assert not (os.stat(src / "note.txt").st_mode & 0o111)
+    assert oct(os.stat(src).st_mode & 0o777) == "0o700"
+
+
 def _wait(env_id, n, timeout=240):
     for _ in range(timeout * 4):
         rec = E.build_record(env_id, n)
@@ -696,6 +843,89 @@ def test_a_pinned_git_clone_connects_to_the_address_the_gateway_classified(store
         with pytest.raises(HTTPException):
             E.import_git("henv_" + "c" * 32, "git@git.example:team/repo.git" if " " in bad else
                          "https://git.example/team/repo.git", pin=bad)
+
+
+def test_pinned_git_clone_handles_ipv6_literal_hosts(store, monkeypatch):
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        os.makedirs(cmd[-1], exist_ok=True)
+        pathlib.Path(cmd[-1], "README.md").write_text("hi\n")
+        return None
+
+    monkeypatch.setattr(E.subprocess, "run", fake_run)
+    eid = "henv_" + "e" * 32
+    E.import_git(eid, "https://[2606:4700::6810:1]/org/repo.git",
+                 pin="[2606:4700::6810:1]:443:2606:4700::6810:1")
+    E.import_git(eid, "http://[2606:4700::6810:1]/org/repo.git",
+                 pin="[2606:4700::6810:1]:80:2606:4700::6810:1")
+    E.import_git(eid, "https://[2606:4700:0000::6810:1]:8443/org/repo.git",
+                 pin="[2606:4700:0000::6810:1]:8443:2606:4700::6810:1")
+    E.import_git(eid, "https://git.example/org/repo.git",
+                 pin="git.example:443:2606:4700::6810:1")
+    E.import_git(eid, "ssh://git@[2606:4700::6810:1]/org/repo.git",
+                 pin="[2606:4700::6810:1]:22:2606:4700::6810:1")
+    E.import_git(eid, "git@[2606:4700::6810:1]:org/repo.git",
+                 pin="[2606:4700::6810:1]:22:2606:4700::6810:1")
+
+    https_lit, http_lit, https_port, https_name_v6, ssh_lit, scp_lit = seen
+    assert https_lit[:4] == ["git", "-c", "http.followRedirects=false", "clone"]
+    assert http_lit[:4] == ["git", "-c", "http.followRedirects=false", "clone"]
+    assert https_port[:4] == ["git", "-c", "http.followRedirects=false", "clone"]
+    assert https_name_v6[:5] == ["git", "-c", "http.curloptResolve=git.example:443:[2606:4700::6810:1]",
+                                 "-c", "http.followRedirects=false"]
+    want_ssh = ["git", "-c", "core.sshCommand=ssh -o HostName=2606:4700::6810:1 -o HostKeyAlias=2606:4700::6810:1"]
+    assert ssh_lit[:3] == want_ssh
+    assert scp_lit[:3] == want_ssh
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    app.include_router(E.router)
+    r = TestClient(app).post(
+        f"/environments/{eid}/import",
+        params={"git_url": "https://[2606:4700::6810:1]/org/repo.git",
+                "git_pin": "[2606:4700::6810:1]:443:2606:4700::6810:1"},
+    )
+    assert r.status_code == 200 and seen[-1][:4] == ["git", "-c", "http.followRedirects=false", "clone"]
+
+    for url, bad_pin in (
+        ("https://[2606:4700::6810:1]/org/repo.git", "2606:4700::6810:1:443:2606:4700::6810:1"),
+        ("https://git.example/org/repo.git", "[git.example]:443:140.82.112.3"),
+        ("https://140.82.112.3/org/repo.git", "[140.82.112.3]:443:140.82.112.3"),
+        ("https://evil.example/org/repo.git", "[2606:4700::6810:1]:443:2606:4700::6810:1"),
+        ("https://[2606:4700::6810:1]:8443/org/repo.git", "[2606:4700::6810:1]:443:2606:4700::6810:1"),
+        ("https://[2606:4700::6810:1]/org/repo.git", "[2606:4700::6810:1]:443:2606:4700::6810:2"),
+        ("https://[2606:4700::6810:1]/org/repo.git", "[2606:4700::6810:1]:0:2606:4700::6810:1"),
+        ("https://[2606:4700::6810:1]/org/repo.git", "[2606:4700::6810:1]:70000:2606:4700::6810:1"),
+        # a zone id: ipaddress parses any text after "%", and the ssh command line is run by a shell
+        ("ssh://git@[2606:4700::6810:1]/org/repo.git", "[2606:4700::6810:1%$(id)]:22:2606:4700::6810:1"),
+        ("git@[2606:4700::6810:1]:org/repo.git", "[2606:4700::6810:1%eth0]:22:2606:4700::6810:1"),
+        ("git@git.example:org/repo.git", "git.example:22:2606:4700::6810:1%$(id)"),
+        ("https://[2606:4700::6810:1%25eth0]/org/repo.git", "[2606:4700::6810:1%eth0]:443:2606:4700::6810:1%eth0"),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            E.import_git(eid, url, pin=bad_pin)
+        assert exc.value.status_code == 400
+
+
+def test_git_accepts_ipv6_literal_pin_args_without_curl_resolve_error():
+    import shutil
+    import subprocess
+
+    if not shutil.which("git"):
+        pytest.skip("git not installed")
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    args = E._git_pin_args("http://[::1]:1/org/repo.git", "[::1]:1:::1")
+    r = subprocess.run(
+        ["git", *args, "ls-remote", "http://[::1]:1/org/repo.git"],
+        capture_output=True, text=True, timeout=5, env=env,
+    )
+    assert r.returncode != 0
+    assert "Couldn't parse CURLOPT_RESOLVE entry" not in r.stderr
+    assert "connect" in r.stderr.lower(), r.stderr
 
 
 def test_a_write_waiting_on_a_snapshot_or_a_slow_import_leaves_the_runner_answering(store, monkeypatch):
